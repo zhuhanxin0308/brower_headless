@@ -1,9 +1,10 @@
 # 使用 Debian 12 (Bookworm) 的轻量版
 FROM node:20-bookworm-slim
 
-# 1. 安装核心依赖：Xvfb 虚拟显示器、字体、以及 Chrome 需要的底层库
+# 1. 安装核心依赖，并补全 ca-certificates 和 curl (替代 wget)
 RUN apt-get update && apt-get install -y \
-    wget \
+    curl \
+    ca-certificates \
     gnupg \
     xvfb \
     dbus-x11 \
@@ -13,9 +14,11 @@ RUN apt-get update && apt-get install -y \
     libvulkan1 \
     --no-install-recommends
 
-# 2. 下载并安装官方原版 Google Chrome (Stable)
-RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
-    && sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list' \
+# 2. 【修复点】使用现代 Debian 标准方法安装 Google Chrome
+RUN install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /etc/apt/keyrings/google-chrome.gpg \
+    && chmod a+r /etc/apt/keyrings/google-chrome.gpg \
+    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list \
     && apt-get update \
     && apt-get install -y google-chrome-stable \
     && rm -rf /var/lib/apt/lists/*
