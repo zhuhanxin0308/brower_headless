@@ -11,7 +11,7 @@ on:
 # 定义环境变量（请务必将下方仓库名修改为你自己的！）
 env:
   # 格式为：你的用户名/你的仓库名
-  IMAGE_NAME: your_dockerhub_username/headless-cdp-api
+  IMAGE_NAME: zhuhanxin0308/brower_headless
 
 jobs:
   build-and-push:
