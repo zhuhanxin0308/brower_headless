@@ -1,0 +1,57 @@
+name: Build and Push Docker Image
+
+# 触发条件：当代码推送到 main 分支，或者推送了版本标签 (如 v1.0.0) 时触发
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*.*.*'
+
+# 定义环境变量（请务必将下方仓库名修改为你自己的！）
+env:
+  # 格式为：你的用户名/你的仓库名
+  IMAGE_NAME: your_dockerhub_username/headless-cdp-api
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    
+    steps:
+      # 1. 拉取当前仓库的代码
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. 设置 Docker Buildx (支持多架构构建和高级缓存)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 3. 登录到 Docker Hub
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # 4. 自动提取标签和元数据
+      # 如果你推送到 main 分支，它会打上 'latest' 标签。如果你推送 'v1.0.0' tag，它会打上对应版本标签。
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+
+      # 5. 构建并推送到 Docker Hub
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # 开启缓存机制，极大加快后续构建速度 (特别是安装 Chromium 这种耗时操作)
+          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
