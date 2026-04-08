@@ -1,31 +1,41 @@
-# 使用 Node 20 Alpine 作为基础镜像
-FROM node:20-alpine
+# 使用 Debian 12 (Bookworm) 的轻量版
+FROM node:20-bookworm-slim
 
-# 安装 Chromium 及字体依赖，并清理缓存以极致压缩体积
-RUN apk add --no-cache \
-    chromium \
-    nss \
-    freetype \
-    harfbuzz \
-    ca-certificates \
-    ttf-freefont
+# 1. 安装核心依赖：Xvfb 虚拟显示器、字体、以及 Chrome 需要的底层库
+RUN apt-get update && apt-get install -y \
+    wget \
+    gnupg \
+    xvfb \
+    dbus-x11 \
+    fonts-liberation \
+    fonts-noto-cjk \
+    libu2f-udev \
+    libvulkan1 \
+    --no-install-recommends
 
-# 设置环境变量指向正确的二进制文件路径
-ENV CHROME_BIN=/usr/bin/chromium-browser \
-    CHROME_PATH=/usr/lib/chromium/
+# 2. 下载并安装官方原版 Google Chrome (Stable)
+RUN wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
+    && sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list' \
+    && apt-get update \
+    && apt-get install -y google-chrome-stable \
+    && rm -rf /var/lib/apt/lists/*
 
-# 设置工作目录
+# 3. 设置工作目录
 WORKDIR /app
 
-# 利用 Docker 层缓存加速构建
+# 4. 安装 Node 依赖 (利用 Docker 缓存)
 COPY package.json ./
 RUN npm install --production
 
-# 复制核心代码
+# 5. 拷贝核心代码和启动脚本
 COPY server.js ./
+COPY entrypoint.sh ./
 
-# 暴露接口端口
+# 6. 赋予启动脚本执行权限
+RUN chmod +x entrypoint.sh
+
+# 暴露 API 端口
 EXPOSE 3000
 
-# 启动服务
-CMD ["npm", "start"]
+# 7. 必须使用 entrypoint 脚本作为入口，以在后台拉起 Xvfb 虚拟显示器
+ENTRYPOINT ["./entrypoint.sh"]
