@@ -1,0 +1,19 @@
+version: '3.8'
+
+services:
+  browser-service:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - API_KEY=your-secret-key        # 建议修改
+      - MIN_BROWSERS=2                  # 最少保持的浏览器数
+      - MAX_BROWSERS=10                 # 最多并发浏览器数
+      - PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+    deploy:
+      resources:
+        limits:
+          memory: 2g                    # 根据服务器内存调整
+    restart: unless-stopped
+    shm_size: '1gb'                     # 共享内存，防止 Chrome 崩溃

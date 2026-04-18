@@ -1,13 +1,17 @@
 {
-  "name": "headless-cdp-api",
+  "name": "browser-service",
   "version": "1.0.0",
-  "description": "Minimal high-performance headless browser API",
+  "description": "高性能无头浏览器渲染服务",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
   "dependencies": {
-    "chrome-remote-interface": "^0.33.0",
-    "fastify": "^4.26.2"
+    "fastify": "^4.26.0",
+    "puppeteer-core": "^22.0.0",
+    "generic-pool": "^3.9.0",
+    "p-limit": "^5.0.0",
+    "dotenv": "^16.4.0"
   }
 }
