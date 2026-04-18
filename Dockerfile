@@ -1,4 +1,4 @@
-FROM node:20-slim
+FROM node:24-slim
 
 # 安装 Chromium 及依赖
 RUN apt-get update && apt-get install -y \
