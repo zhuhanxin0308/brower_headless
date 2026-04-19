@@ -153,5 +153,6 @@ curl http://localhost:3000/health
 |---------|--------|------|
 | MIN_BROWSERS | 2 | 池中最少保持的浏览器实例数 |
 | MAX_BROWSERS | 10 | 最大并发浏览器数，按服务器内存调整（每个约 200MB）|
+| ALLOW_PRIVATE_NETWORK | false | 是否允许访问本地或内网地址，默认关闭以避免 SSRF 风险 |
 
 建议：8GB 内存服务器设 MAX_BROWSERS=15，16GB 设 25。
