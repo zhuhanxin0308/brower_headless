@@ -20,7 +20,7 @@ const CHROME_ARGS = [
   '--disable-gpu',
   '--no-first-run',
   '--no-zygote',
-  '--single-process',
+  // 不能启用 single-process，否则独立 BrowserContext 在 Linux/Chromium 容器内会直接失败。
   '--disable-blink-features=AutomationControlled',
   '--disable-infobars',
   '--hide-scrollbars',
