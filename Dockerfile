@@ -1,15 +1,20 @@
-FROM node:24-slim
+FROM node:lts-alpine3.22
 
-# 安装 Chromium 及依赖
-RUN apt-get update && apt-get install -y \
+# 1. 替换包管理器为 apk，并安装 Alpine 下的 Chromium 及其渲染依赖
+# --no-cache 可以避免产生缓存文件，减小镜像体积
+RUN apk add --no-cache \
     chromium \
-    fonts-noto-cjk \
+    nss \
+    freetype \
+    harfbuzz \
     ca-certificates \
-    --no-install-recommends && \
-    rm -rf /var/lib/apt/lists/*
+    ttf-freefont \
+    font-noto-cjk
 
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
+# 2. 设置 Puppeteer 环境变量
+# 注意：在 Alpine 中，Chromium 的默认执行路径通常是 /usr/bin/chromium-browser
+ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
+    PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
 
 WORKDIR /app
 COPY package*.json ./
