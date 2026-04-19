@@ -46,7 +46,7 @@ jobs:
           context: .
           push: true
           # 新增：几乎涵盖了所有常见和部分冷门的硬件架构
-          platforms: linux/amd64,linux/arm64/v8,linux/s390x
+          platforms: linux/amd64,linux/arm64/v8
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
