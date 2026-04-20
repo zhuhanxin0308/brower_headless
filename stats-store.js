@@ -1,21 +1,52 @@
 const DEFAULT_MAX_RECENT_REQUESTS = 60;
 const DEFAULT_MAX_RECENT_LATENCIES = 2000;
-const DASHBOARD_EXCLUDED_PATHS = new Set(['/', '/favicon.ico']);
+const TRACKED_API_ROUTES = [
+  'GET /health',
+  'POST /render',
+  'POST /screenshot',
+  'POST /intercept',
+  'POST /fetch-file',
+];
+const TRACKED_API_ROUTE_KEYS = new Set(TRACKED_API_ROUTES);
 
-// 统一限制数组长度，避免历史记录无限增长导致内存持续膨胀。
-function pushLimited(list, value, maxSize) {
-  if (maxSize <= 0) {
-    return;
+// 用环形缓冲区替代 shift，避免高频写入时反复搬移数组元素。
+function createCircularBuffer(maxSize) {
+  const values = maxSize > 0 ? new Array(maxSize) : [];
+  let size = 0;
+  let nextWriteIndex = 0;
+
+  function getOrderedIndex(offset) {
+    return (nextWriteIndex - size + offset + maxSize) % maxSize;
   }
 
-  list.push(value);
+  return {
+    push(value) {
+      if (maxSize <= 0) {
+        return;
+      }
 
-  while (list.length > maxSize) {
-    list.shift();
-  }
+      values[nextWriteIndex] = value;
+      nextWriteIndex = (nextWriteIndex + 1) % maxSize;
+      size = Math.min(size + 1, maxSize);
+    },
+    toArray() {
+      if (size === 0) {
+        return [];
+      }
+
+      return Array.from({ length: size }, (_, index) => values[getOrderedIndex(index)]);
+    },
+    toReversedArray() {
+      if (size === 0) {
+        return [];
+      }
+
+      return Array.from({ length: size }, (_, index) => values[getOrderedIndex(size - 1 - index)]);
+    },
+  };
 }
 
-function createMetricBucket() {
+function createMetricBucket(maxRecentLatencies) {
   return {
     totalRequests: 0,
     successRequests: 0,
@@ -25,7 +56,7 @@ function createMetricBucket() {
     lastDurationMs: 0,
     lastRequestedAt: null,
     lastStatusCode: null,
-    recentDurations: [],
+    recentDurations: createCircularBuffer(maxRecentLatencies),
     statusCounts: {},
   };
 }
@@ -38,12 +69,11 @@ function normalizeDuration(durationMs) {
   return Number(durationMs.toFixed(2));
 }
 
-function calculatePercentile(values, percentile) {
-  if (values.length === 0) {
+function calculatePercentile(sortedValues, percentile) {
+  if (sortedValues.length === 0) {
     return 0;
   }
 
-  const sortedValues = [...values].sort((left, right) => left - right);
   const position = (sortedValues.length - 1) * (percentile / 100);
   const lowerIndex = Math.floor(position);
   const upperIndex = Math.ceil(position);
@@ -59,6 +89,11 @@ function calculatePercentile(values, percentile) {
 }
 
 function summarizeMetricBucket(bucket) {
+  const recentDurations = bucket.recentDurations.toArray();
+  // 单次排序后复用到多个分位计算，避免首页每次刷新都重复排序同一批数据。
+  const sortedDurations = recentDurations.length > 1
+    ? [...recentDurations].sort((left, right) => left - right)
+    : recentDurations;
   const avgDurationMs = bucket.totalRequests === 0
     ? 0
     : Number((bucket.totalDurationMs / bucket.totalRequests).toFixed(2));
@@ -71,9 +106,9 @@ function summarizeMetricBucket(bucket) {
     successRequests: bucket.successRequests,
     errorRequests: bucket.errorRequests,
     avgDurationMs,
-    p50DurationMs: calculatePercentile(bucket.recentDurations, 50),
-    p95DurationMs: calculatePercentile(bucket.recentDurations, 95),
-    p99DurationMs: calculatePercentile(bucket.recentDurations, 99),
+    p50DurationMs: calculatePercentile(sortedDurations, 50),
+    p95DurationMs: calculatePercentile(sortedDurations, 95),
+    p99DurationMs: calculatePercentile(sortedDurations, 99),
     maxDurationMs: Number(bucket.maxDurationMs.toFixed(2)),
     lastDurationMs: Number(bucket.lastDurationMs.toFixed(2)),
     lastRequestedAt: bucket.lastRequestedAt,
@@ -83,18 +118,22 @@ function summarizeMetricBucket(bucket) {
   };
 }
 
+function createRouteKey(method, path) {
+  return `${String(method || '').toUpperCase()} ${path || ''}`.trim();
+}
+
 function createStatsStore(options = {}) {
   const now = options.now ?? (() => Date.now());
   const maxRecentRequests = options.maxRecentRequests ?? DEFAULT_MAX_RECENT_REQUESTS;
   const maxRecentLatencies = options.maxRecentLatencies ?? DEFAULT_MAX_RECENT_LATENCIES;
   const serviceStartedAtMs = now();
-  const overallMetrics = createMetricBucket();
+  const overallMetrics = createMetricBucket(maxRecentLatencies);
   const endpointMetrics = new Map();
-  const recentRequests = [];
+  const recentRequests = createCircularBuffer(maxRecentRequests);
   let inflightRequests = 0;
 
   function shouldTrackRequest(method, path) {
-    return Boolean(method) && Boolean(path) && !DASHBOARD_EXCLUDED_PATHS.has(path);
+    return TRACKED_API_ROUTE_KEYS.has(createRouteKey(method, path));
   }
 
   function getEndpointBucket(method, path) {
@@ -104,7 +143,7 @@ function createStatsStore(options = {}) {
       endpointMetrics.set(endpointKey, {
         method: method.toUpperCase(),
         path,
-        metrics: createMetricBucket(),
+        metrics: createMetricBucket(maxRecentLatencies),
       });
     }
 
@@ -146,7 +185,7 @@ function createStatsStore(options = {}) {
       bucket.lastRequestedAt = normalizedRequestedAt;
       bucket.lastStatusCode = statusCode;
       bucket.statusCounts[statusCode] = (bucket.statusCounts[statusCode] || 0) + 1;
-      pushLimited(bucket.recentDurations, normalizedDuration, maxRecentLatencies);
+      bucket.recentDurations.push(normalizedDuration);
 
       if (isSuccess) {
         bucket.successRequests += 1;
@@ -156,14 +195,14 @@ function createStatsStore(options = {}) {
     });
 
     // 最近调用记录保留关键信息，便于首页快速定位最新异常与慢请求。
-    pushLimited(recentRequests, {
+    recentRequests.push({
       method: method.toUpperCase(),
       path,
       statusCode,
       durationMs: normalizedDuration,
       requestedAt: normalizedRequestedAt,
       errorMessage,
-    }, maxRecentRequests);
+    });
   }
 
   function buildSnapshot({ poolInfo = null } = {}) {
@@ -200,8 +239,8 @@ function createStatsStore(options = {}) {
       overview,
       pool,
       endpoints,
-      recentRequests: [...recentRequests].reverse(),
-      excludedPaths: [...DASHBOARD_EXCLUDED_PATHS],
+      recentRequests: recentRequests.toReversedArray(),
+      trackedRoutes: TRACKED_API_ROUTES,
     };
   }
 
@@ -214,6 +253,7 @@ function createStatsStore(options = {}) {
 }
 
 module.exports = {
-  DASHBOARD_EXCLUDED_PATHS,
+  TRACKED_API_ROUTES,
+  TRACKED_API_ROUTE_KEYS,
   createStatsStore,
 };

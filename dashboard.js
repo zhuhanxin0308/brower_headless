@@ -59,7 +59,7 @@ function renderMetricCard({ label, value, note, accent }) {
       <span class="metric-accent ${escapeHtml(accent)}"></span>
       <p class="metric-label">${escapeHtml(label)}</p>
       <strong class="metric-value">${escapeHtml(value)}</strong>
-      <p class="metric-note">${escapeHtml(note)}</p>
+      ${note ? `<p class="metric-note">${escapeHtml(note)}</p>` : ''}
     </article>
   `;
 }
@@ -158,7 +158,7 @@ function renderDashboardHtml(snapshot) {
     {
       label: '当前进行中请求',
       value: formatInteger(snapshot.inflightRequests),
-      note: '仅统计业务接口，不包含首页本身',
+      note: '',
       accent: 'accent-orange',
     },
     {
@@ -257,14 +257,6 @@ function renderDashboardHtml(snapshot) {
         line-height: 1.05;
       }
 
-      .hero-text {
-        margin: 16px 0 0;
-        max-width: 720px;
-        color: var(--muted);
-        line-height: 1.7;
-        font-size: 15px;
-      }
-
       .hero-meta {
         padding: 24px;
         display: grid;
@@ -335,7 +327,6 @@ function renderDashboardHtml(snapshot) {
       }
 
       .metric-label,
-      .panel-subtitle,
       .subtle-text,
       .metric-note {
         color: var(--muted);
@@ -375,12 +366,6 @@ function renderDashboardHtml(snapshot) {
       .panel-title {
         margin: 0;
         font-size: 20px;
-      }
-
-      .panel-subtitle {
-        margin: 6px 0 0;
-        font-size: 13px;
-        line-height: 1.6;
       }
 
       .pool-grid {
@@ -475,12 +460,6 @@ function renderDashboardHtml(snapshot) {
         text-align: center;
       }
 
-      .footer-note {
-        color: var(--muted);
-        font-size: 13px;
-        text-align: right;
-      }
-
       @media (max-width: 1080px) {
         .metric-grid,
         .pool-grid {
@@ -521,10 +500,6 @@ function renderDashboardHtml(snapshot) {
         <div class="hero-main">
           <p class="eyebrow">Browser Service Dashboard</p>
           <h1>服务运行看板</h1>
-          <p class="hero-text">
-            当前页面基于进程启动以来保留的历史调用记录实时生成，默认每 15 秒自动刷新一次。
-            统计口径聚焦业务接口，不把首页和 favicon 请求计入性能数据，避免观测行为反向污染结果。
-          </p>
         </div>
         <aside class="hero-meta">
           <div class="meta-row">
@@ -539,10 +514,6 @@ function renderDashboardHtml(snapshot) {
             <span class="meta-label">页面生成时间</span>
             <strong class="meta-value">${escapeHtml(formatTime(snapshot.generatedAt))}</strong>
           </div>
-          <div class="meta-row">
-            <span class="meta-label">排除统计路径</span>
-            <strong class="meta-value">${escapeHtml(snapshot.excludedPaths.join(', '))}</strong>
-          </div>
         </aside>
       </section>
 
@@ -552,20 +523,14 @@ function renderDashboardHtml(snapshot) {
 
       <section class="panel">
         <div class="panel-header">
-          <div>
-            <h2 class="panel-title">浏览器池状态</h2>
-            <p class="panel-subtitle">用于判断当前实例是否已经逼近浏览器并发上限。</p>
-          </div>
+          <div><h2 class="panel-title">浏览器池状态</h2></div>
         </div>
         ${renderPoolPanel(snapshot.pool)}
       </section>
 
       <section class="panel">
         <div class="panel-header">
-          <div>
-            <h2 class="panel-title">接口历史概览</h2>
-            <p class="panel-subtitle">按接口聚合请求量、成功率与延迟分位，优先帮助定位最热和最慢的接口。</p>
-          </div>
+          <div><h2 class="panel-title">接口历史概览</h2></div>
         </div>
         <table>
           <thead>
@@ -587,10 +552,7 @@ function renderDashboardHtml(snapshot) {
 
       <section class="panel">
         <div class="panel-header">
-          <div>
-            <h2 class="panel-title">最近调用记录</h2>
-            <p class="panel-subtitle">保留最近一批调用的状态码、耗时和错误摘要，用于快速发现最新异常。</p>
-          </div>
+          <div><h2 class="panel-title">最近调用记录</h2></div>
         </div>
         <table>
           <thead>
@@ -607,8 +569,6 @@ function renderDashboardHtml(snapshot) {
           </tbody>
         </table>
       </section>
-
-      <p class="footer-note">刷新本页不会进入性能统计，适合长期挂在监控屏或浏览器标签页中观察。</p>
     </main>
   </body>
 </html>
