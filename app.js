@@ -1,9 +1,12 @@
 const Fastify = require('fastify');
 const { createBrowserPool } = require('./browser-pool');
+const { renderDashboardHtml } = require('./dashboard');
 const rendererApiDefault = require('./renderer');
+const { createStatsStore } = require('./stats-store');
 const { assertAllowedUrl } = require('./url-security');
 
 const DEFAULT_BODY_LIMIT = 1048576;
+const DASHBOARD_PUBLIC_PATHS = new Set(['/', '/favicon.ico']);
 
 // 统一解析布尔环境变量，避免在各处手写大小写判断。
 function parseBoolean(value, defaultValue = false) {
@@ -17,6 +20,14 @@ function parseBoolean(value, defaultValue = false) {
 function parseInteger(value, defaultValue) {
   const parsedValue = Number.parseInt(value, 10);
   return Number.isNaN(parsedValue) ? defaultValue : parsedValue;
+}
+
+function normalizeRequestPath(rawUrl = '/') {
+  return String(rawUrl).split('?')[0] || '/';
+}
+
+function isDashboardPublicRequest(method, path) {
+  return method === 'GET' && DASHBOARD_PUBLIC_PATHS.has(path);
 }
 
 const cookieSchema = {
@@ -44,11 +55,14 @@ const cookieSchema = {
 function buildApp(options = {}) {
   const apiKey = options.apiKey ?? process.env.API_KEY ?? '';
   const allowPrivateNetwork = options.allowPrivateNetwork ?? parseBoolean(process.env.ALLOW_PRIVATE_NETWORK, false);
+  const minBrowsers = parseInteger(process.env.MIN_BROWSERS, 2);
+  const maxBrowsers = parseInteger(process.env.MAX_BROWSERS, 10);
   const browserPoolFactory = options.browserPoolFactory ?? (() => createBrowserPool({
-    minBrowsers: parseInteger(process.env.MIN_BROWSERS, 2),
-    maxBrowsers: parseInteger(process.env.MAX_BROWSERS, 10),
+    minBrowsers,
+    maxBrowsers,
   }));
   const rendererApi = options.rendererApi ?? rendererApiDefault;
+  const statsStore = options.statsStore ?? createStatsStore();
   const urlLookup = options.urlLookup;
 
   const app = Fastify({
@@ -66,11 +80,18 @@ function buildApp(options = {}) {
   }
 
   app.addHook('preHandler', async (req, reply) => {
+    const requestPath = normalizeRequestPath(req.raw.url);
+
+    if (isDashboardPublicRequest(req.method, requestPath)) {
+      return;
+    }
+
     if (!apiKey) {
       return;
     }
 
     if (req.headers['x-api-key'] !== apiKey) {
+      req.requestErrorMessage = 'Unauthorized';
       return reply.code(401).send({ ok: false, error: 'Unauthorized' });
     }
   });
@@ -87,6 +108,44 @@ function buildApp(options = {}) {
 
     await pool.drain();
     await pool.clear();
+  });
+
+  app.addHook('onRequest', async (req) => {
+    req.metricsPath = normalizeRequestPath(req.raw.url);
+    req.metricsStartedAt = statsStore.markRequestStart(req.method, req.metricsPath);
+    req.requestErrorMessage = '';
+  });
+
+  app.addHook('onResponse', async (req, reply) => {
+    if (req.metricsStartedAt == null) {
+      return;
+    }
+
+    statsStore.recordRequest({
+      method: req.method,
+      path: req.metricsPath,
+      statusCode: reply.statusCode,
+      durationMs: Date.now() - req.metricsStartedAt,
+      requestedAt: new Date().toISOString(),
+      errorMessage: req.requestErrorMessage,
+    });
+  });
+
+  app.get('/', async (_req, reply) => {
+    const poolInfo = pool
+      ? { size: pool.size, available: pool.available, borrowed: pool.borrowed, minBrowsers, maxBrowsers }
+      : null;
+    const snapshot = statsStore.buildSnapshot({ poolInfo });
+
+    reply.type('text/html; charset=utf-8');
+    reply.header('Cache-Control', 'no-store');
+    return reply.send(renderDashboardHtml(snapshot));
+  });
+
+  app.get('/favicon.ico', async (_req, reply) => {
+    reply.code(204);
+    reply.header('Cache-Control', 'public, max-age=86400');
+    return reply.send();
   });
 
   app.post('/render', {
@@ -111,6 +170,7 @@ function buildApp(options = {}) {
       const result = await rendererApi.renderPage(pool, { url, waitFor, timeout, headers, cookies });
       return { ok: true, ...result };
     } catch (error) {
+      req.requestErrorMessage = error.message;
       return reply.code(error.statusCode || 500).send({ ok: false, error: error.message });
     }
   });
@@ -172,6 +232,7 @@ function buildApp(options = {}) {
       reply.header('Content-Disposition', `inline; filename="screenshot.${format || 'png'}"`);
       return reply.send(buffer);
     } catch (error) {
+      req.requestErrorMessage = error.message;
       return reply.code(error.statusCode || 500).send({ ok: false, error: error.message });
     }
   });
@@ -203,6 +264,7 @@ function buildApp(options = {}) {
       const result = await rendererApi.interceptRequests(pool, { url, listenUrls, fileTypes, timeout, headers, cookies });
       return { ok: true, ...result };
     } catch (error) {
+      req.requestErrorMessage = error.message;
       return reply.code(error.statusCode || 500).send({ ok: false, error: error.message });
     }
   });
@@ -230,6 +292,7 @@ function buildApp(options = {}) {
       const { buffer, contentType } = await rendererApi.fetchFile(pool, { url, fileUrl, timeout, cookies });
 
       if (!buffer) {
+        req.requestErrorMessage = '未找到目标文件';
         return reply.code(404).send({ ok: false, error: '未找到目标文件' });
       }
 
@@ -237,6 +300,7 @@ function buildApp(options = {}) {
       reply.header('Content-Disposition', 'attachment');
       return reply.send(buffer);
     } catch (error) {
+      req.requestErrorMessage = error.message;
       return reply.code(error.statusCode || 500).send({ ok: false, error: error.message });
     }
   });
