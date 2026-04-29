@@ -12,7 +12,6 @@
     "dotenv": "^16.4.0",
     "fastify": "^4.26.0",
     "generic-pool": "^3.9.0",
-    "p-limit": "^5.0.0",
     "puppeteer-core": "^22.0.0",
     "puppeteer-extra": "^3.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2"

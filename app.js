@@ -1,3 +1,4 @@
+const crypto = require('node:crypto');
 const Fastify = require('fastify');
 const { createBrowserPool } = require('./browser-pool');
 const { renderDashboardHtml } = require('./dashboard');
@@ -30,6 +31,37 @@ function isDashboardPublicRequest(method, path) {
   return method === 'GET' && DASHBOARD_PUBLIC_PATHS.has(path);
 }
 
+// 使用常量时间比较 API Key，防止 timing attack 侧信道泄漏密钥内容。
+function safeEqual(a, b) {
+  if (typeof a !== 'string' || typeof b !== 'string') {
+    return false;
+  }
+
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+
+  if (bufA.length !== bufB.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+
+// 检查浏览器池是否可用且排队深度未超限，快速拒绝过载请求避免请求无限堆积。
+function ensurePoolCapacity(pool, maxPending) {
+  if (!pool) {
+    const error = new Error('浏览器池尚未初始化');
+    error.statusCode = 503;
+    throw error;
+  }
+
+  if (pool.pending > maxPending) {
+    const error = new Error('服务繁忙，请稍后重试');
+    error.statusCode = 503;
+    throw error;
+  }
+}
+
 const cookieSchema = {
   oneOf: [
     { type: 'string' },
@@ -57,6 +89,8 @@ function buildApp(options = {}) {
   const allowPrivateNetwork = options.allowPrivateNetwork ?? parseBoolean(process.env.ALLOW_PRIVATE_NETWORK, false);
   const minBrowsers = parseInteger(process.env.MIN_BROWSERS, 2);
   const maxBrowsers = parseInteger(process.env.MAX_BROWSERS, 10);
+  // 最大排队深度：允许最多 maxBrowsers 个请求在池中等待，超过后快速拒绝。
+  const maxPendingAcquires = options.maxPendingAcquires ?? maxBrowsers;
   const browserPoolFactory = options.browserPoolFactory ?? (() => createBrowserPool({
     minBrowsers,
     maxBrowsers,
@@ -90,7 +124,7 @@ function buildApp(options = {}) {
       return;
     }
 
-    if (req.headers['x-api-key'] !== apiKey) {
+    if (!safeEqual(req.headers['x-api-key'], apiKey)) {
       req.requestErrorMessage = 'Unauthorized';
       return reply.code(401).send({ ok: false, error: 'Unauthorized' });
     }
@@ -113,7 +147,17 @@ function buildApp(options = {}) {
   app.addHook('onRequest', async (req) => {
     req.metricsPath = normalizeRequestPath(req.raw.url);
     req.metricsStartedAt = statsStore.markRequestStart(req.method, req.metricsPath);
+    // 记录请求到达时间（而非响应完成时间），与字段名 requestedAt 语义一致。
+    req.requestStartedAt = req.metricsStartedAt
+      ? new Date(req.metricsStartedAt).toISOString()
+      : null;
     req.requestErrorMessage = '';
+  });
+
+  // 安全响应头：防止 MIME 嗅探和点击劫持。
+  app.addHook('onSend', async (_req, reply) => {
+    reply.header('X-Content-Type-Options', 'nosniff');
+    reply.header('X-Frame-Options', 'DENY');
   });
 
   app.addHook('onResponse', async (req, reply) => {
@@ -126,7 +170,7 @@ function buildApp(options = {}) {
       path: req.metricsPath,
       statusCode: reply.statusCode,
       durationMs: Date.now() - req.metricsStartedAt,
-      requestedAt: new Date().toISOString(),
+      requestedAt: req.requestStartedAt,
       errorMessage: req.requestErrorMessage,
     });
   });
@@ -159,15 +203,24 @@ function buildApp(options = {}) {
           timeout: { type: 'number', default: 15000 },
           headers: { type: 'object', additionalProperties: { type: 'string' } },
           cookies: cookieSchema,
+          viewport: {
+            type: 'object',
+            properties: {
+              width: { type: 'number', default: 1440 },
+              height: { type: 'number', default: 900 },
+              deviceScaleFactor: { type: 'number', default: 1 },
+            },
+          },
         },
       },
     },
   }, async (req, reply) => {
-    const { url, waitFor, timeout, headers, cookies } = req.body;
+    const { url, waitFor, timeout, headers, cookies, viewport } = req.body;
 
     try {
+      ensurePoolCapacity(pool, maxPendingAcquires);
       await validateTargetUrl(url);
-      const result = await rendererApi.renderPage(pool, { url, waitFor, timeout, headers, cookies });
+      const result = await rendererApi.renderPage(pool, { url, waitFor, timeout, headers, cookies, viewport });
       return { ok: true, ...result };
     } catch (error) {
       req.requestErrorMessage = error.message;
@@ -214,6 +267,7 @@ function buildApp(options = {}) {
     const { url, waitFor, timeout, headers, cookies, format, fullPage, quality, clip, viewport } = req.body;
 
     try {
+      ensurePoolCapacity(pool, maxPendingAcquires);
       await validateTargetUrl(url);
       const { buffer, contentType } = await rendererApi.screenshotPage(pool, {
         url,
@@ -260,6 +314,7 @@ function buildApp(options = {}) {
     const { url, listenUrls, fileTypes, timeout, headers, cookies } = req.body;
 
     try {
+      ensurePoolCapacity(pool, maxPendingAcquires);
       await validateTargetUrl(url);
       const result = await rendererApi.interceptRequests(pool, { url, listenUrls, fileTypes, timeout, headers, cookies });
       return { ok: true, ...result };
@@ -276,6 +331,7 @@ function buildApp(options = {}) {
         required: ['url', 'fileUrl'],
         properties: {
           url: { type: 'string' },
+          // 传入 '_any_' 表示抓取页面中的任意网络资源。
           fileUrl: { type: 'string' },
           timeout: { type: 'number', default: 20000 },
           cookies: cookieSchema,
@@ -286,8 +342,12 @@ function buildApp(options = {}) {
     const { url, fileUrl, timeout, cookies } = req.body;
 
     try {
+      ensurePoolCapacity(pool, maxPendingAcquires);
       await validateTargetUrl(url);
-      await validateTargetUrl(fileUrl);
+      // fileUrl 为 '_any_' 时表示抓取页面中的任意网络资源，跳过 URL 安全校验。
+      if (fileUrl !== '_any_') {
+        await validateTargetUrl(fileUrl);
+      }
 
       const { buffer, contentType } = await rendererApi.fetchFile(pool, { url, fileUrl, timeout, cookies });
 
@@ -318,6 +378,8 @@ function buildApp(options = {}) {
 
 module.exports = {
   buildApp,
+  ensurePoolCapacity,
   parseBoolean,
   parseInteger,
+  safeEqual,
 };

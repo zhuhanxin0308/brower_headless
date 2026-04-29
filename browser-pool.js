@@ -6,10 +6,10 @@ const { createPool } = require('generic-pool');
 
 // 维持一组常见桌面端 UA，结合 stealth 插件降低被简单规则识别的概率。
 const USER_AGENTS = [
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0',
 ];
 
 const CHROME_ARGS = [
@@ -77,7 +77,7 @@ function createBrowserPool(options = {}) {
       const puppeteer = createStealthPuppeteer(userAgent);
       const browser = await puppeteer.launch({
         executablePath,
-        headless: 'new',
+        headless: true,
         args: CHROME_ARGS,
         ignoreHTTPSErrors: true,
       });
@@ -107,15 +107,20 @@ function createBrowserPool(options = {}) {
 }
 
 // 每次请求都使用独立 BrowserContext，彻底隔离 cookie、缓存和 localStorage。
+// 外层 try/finally 确保 createBrowserContext 或 newPage 失败时浏览器也能归还到池中。
 async function withPage(pool, fn) {
   const browser = await pool.acquire();
-  const context = await browser.createBrowserContext();
-  const page = await context.newPage();
 
   try {
-    return await fn(page, context);
+    const context = await browser.createBrowserContext();
+    const page = await context.newPage();
+
+    try {
+      return await fn(page, context);
+    } finally {
+      await context.close().catch(() => {});
+    }
   } finally {
-    await context.close().catch(() => {});
     pool.release(browser);
   }
 }

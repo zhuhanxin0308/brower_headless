@@ -44,8 +44,17 @@ function createAsyncTaskTracker() {
   };
 }
 
-async function renderPage(pool, { url, waitFor, timeout = 15000, headers = {}, cookies }) {
+async function renderPage(pool, {
+  url,
+  waitFor,
+  timeout = 15000,
+  headers = {},
+  cookies,
+  viewport = { width: 1440, height: 900, deviceScaleFactor: 1 },
+}) {
   return withPage(pool, async (page) => {
+    await page.setViewport(viewport);
+
     if (Object.keys(headers).length > 0) {
       await page.setExtraHTTPHeaders(headers);
     }

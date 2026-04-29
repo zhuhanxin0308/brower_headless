@@ -85,6 +85,7 @@ curl -X POST http://localhost:3000/render \
 | `timeout` | `number` | 超时毫秒数，默认 `15000` |
 | `headers` | `object` | 附加请求头 |
 | `cookies` | `string \| object[]` | Cookie 字符串或 Cookie 对象数组 |
+| `viewport` | `object` | 视口设置，支持 `width`、`height`、`deviceScaleFactor`，默认 `1440×900` |
 
 ### 返回示例
 
@@ -225,7 +226,7 @@ curl -X POST http://localhost:3000/fetch-file \
 | 参数 | 类型 | 说明 |
 |------|------|------|
 | `url` | `string` | 触发下载的页面 URL，必填 |
-| `fileUrl` | `string` | 目标文件 URL，必填 |
+| `fileUrl` | `string` | 目标文件 URL，必填。传入 `_any_` 表示抓取页面中的任意网络资源 |
 | `timeout` | `number` | 超时毫秒数，默认 `20000` |
 | `cookies` | `string \| object[]` | Cookie 字符串或 Cookie 对象数组 |
 
