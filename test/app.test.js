@@ -381,6 +381,42 @@ test('buildApp 的 screenshot 接口会返回图片流并写入统计', async (t
   assert.equal(snapshot.endpoints[0].name, 'POST /screenshot');
 });
 
+test('buildApp 的 screenshot 接口会透传资源阻断配置', async (t) => {
+  let capturedOptions = null;
+  const rendererApi = createRendererStub();
+  rendererApi.screenshotPage = async (_pool, options) => {
+    capturedOptions = options;
+    return { buffer: Buffer.from('image'), contentType: 'image/png' };
+  };
+
+  const app = buildApp({
+    apiKey: 'secret',
+    logger: false,
+    browserPoolFactory: createPoolStub,
+    rendererApi,
+    urlLookup: async () => [{ address: '93.184.216.34', family: 4 }],
+  });
+
+  t.after(async () => {
+    await app.close();
+  });
+
+  const response = await app.inject({
+    method: 'POST',
+    url: '/screenshot',
+    headers: { 'x-api-key': 'secret' },
+    payload: {
+      url: 'https://example.com',
+      blockedResourceTypes: ['media', 'font'],
+      blockedUrlPatterns: ['analytics.example.com'],
+    },
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(capturedOptions.blockedResourceTypes, ['media', 'font']);
+  assert.deepEqual(capturedOptions.blockedUrlPatterns, ['analytics.example.com']);
+});
+
 // ====== intercept 接口 ======
 
 test('buildApp 的 intercept 接口会返回抓取结果', async (t) => {
@@ -417,6 +453,40 @@ test('buildApp 的 intercept 接口会返回抓取结果', async (t) => {
 
   const snapshot = statsStore.buildSnapshot();
   assert.equal(snapshot.endpoints[0].name, 'POST /intercept');
+});
+
+test('buildApp 的 intercept 接口会透传自定义 waitFor', async (t) => {
+  let capturedOptions = null;
+  const rendererApi = createRendererStub();
+  rendererApi.interceptRequests = async (_pool, options) => {
+    capturedOptions = options;
+    return { finalUrl: 'https://example.com', captured: [], files: [] };
+  };
+
+  const app = buildApp({
+    apiKey: 'secret',
+    logger: false,
+    browserPoolFactory: createPoolStub,
+    rendererApi,
+    urlLookup: async () => [{ address: '93.184.216.34', family: 4 }],
+  });
+
+  t.after(async () => {
+    await app.close();
+  });
+
+  const response = await app.inject({
+    method: 'POST',
+    url: '/intercept',
+    headers: { 'x-api-key': 'secret' },
+    payload: {
+      url: 'https://example.com',
+      waitFor: 'domcontentloaded',
+    },
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(capturedOptions.waitFor, 'domcontentloaded');
 });
 
 // ====== fetch-file 接口 ======
@@ -488,6 +558,78 @@ test('buildApp 的 fetch-file 接口支持 _any_ 通配且不对 fileUrl 做安�
 
   assert.equal(response.statusCode, 200);
   assert.equal(response.headers['content-type'], 'application/octet-stream');
+});
+
+test('buildApp 的 fetch-file 接口会透传 waitFor 和受限后的 maxBytes', async (t) => {
+  let capturedOptions = null;
+  const rendererApi = createRendererStub();
+  rendererApi.fetchFile = async (_pool, options) => {
+    capturedOptions = options;
+    return { buffer: Buffer.from('data'), contentType: 'application/octet-stream' };
+  };
+
+  const app = buildApp({
+    apiKey: 'secret',
+    logger: false,
+    browserPoolFactory: createPoolStub,
+    rendererApi,
+    maxFetchFileBytes: 2048,
+    urlLookup: async () => [{ address: '93.184.216.34', family: 4 }],
+  });
+
+  t.after(async () => {
+    await app.close();
+  });
+
+  const response = await app.inject({
+    method: 'POST',
+    url: '/fetch-file',
+    headers: { 'x-api-key': 'secret' },
+    payload: {
+      url: 'https://example.com',
+      fileUrl: 'https://cdn.example.com/file.bin',
+      waitFor: 'domcontentloaded',
+      maxBytes: 4096,
+    },
+  });
+
+  assert.equal(response.statusCode, 200);
+  assert.equal(capturedOptions.waitFor, 'domcontentloaded');
+  assert.equal(capturedOptions.maxBytes, 2048);
+});
+
+test('buildApp 的 fetch-file 接口会把超限错误返回 413', async (t) => {
+  const rendererApi = createRendererStub();
+  rendererApi.fetchFile = async () => {
+    const error = new Error('目标文件超过大小限制');
+    error.statusCode = 413;
+    throw error;
+  };
+
+  const app = buildApp({
+    apiKey: 'secret',
+    logger: false,
+    browserPoolFactory: createPoolStub,
+    rendererApi,
+    urlLookup: async () => [{ address: '93.184.216.34', family: 4 }],
+  });
+
+  t.after(async () => {
+    await app.close();
+  });
+
+  const response = await app.inject({
+    method: 'POST',
+    url: '/fetch-file',
+    headers: { 'x-api-key': 'secret' },
+    payload: {
+      url: 'https://example.com',
+      fileUrl: 'https://cdn.example.com/file.bin',
+    },
+  });
+
+  assert.equal(response.statusCode, 413);
+  assert.match(response.json().error, /超过大小限制/);
 });
 
 // ====== 安全响应头 ======

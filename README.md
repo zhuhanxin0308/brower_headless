@@ -40,6 +40,7 @@ npm start
 | `HOST` | `0.0.0.0` | 监听地址 |
 | `MIN_BROWSERS` | `2` | 浏览器池最小实例数 |
 | `MAX_BROWSERS` | `10` | 浏览器池最大实例数 |
+| `MAX_FETCH_FILE_BYTES` | `52428800` | `/fetch-file` 单次文件最大字节数 |
 | `PUPPETEER_EXECUTABLE_PATH` | `/usr/bin/chromium` | Chromium 可执行文件路径 |
 | `ALLOW_PRIVATE_NETWORK` | `false` | 是否允许访问本地或内网地址。默认关闭以避免 SSRF 风险 |
 
@@ -138,6 +139,8 @@ curl -X POST http://localhost:3000/screenshot \
 | `quality` | `number` | `jpeg` / `webp` 质量，范围 `0-100` |
 | `clip` | `object` | 指定截图区域，传入后会忽略 `fullPage` |
 | `viewport` | `object` | 视口设置，支持 `width`、`height`、`deviceScaleFactor` |
+| `blockedResourceTypes` | `string[]` | 截图时阻断的资源类型，例如 `media`、`font` |
+| `blockedUrlPatterns` | `string[]` | 截图时阻断的 URL 关键字，例如第三方埋点域名 |
 
 ### 返回说明
 
@@ -172,6 +175,7 @@ curl -X POST http://localhost:3000/intercept \
 | `url` | `string` | 目标页面 URL，必填 |
 | `listenUrls` | `string[]` | 需要监听的接口 URL 关键字 |
 | `fileTypes` | `string[]` | 需要记录的资源类型：`image` / `video` / `audio` / `pdf` / `json` / `css` / `js` / `font` |
+| `waitFor` | `string` | 等待时机：`load` / `domcontentloaded` / `networkidle0` / `networkidle2` |
 | `timeout` | `number` | 超时毫秒数，默认 `20000` |
 | `headers` | `object` | 附加请求头 |
 | `cookies` | `string \| object[]` | Cookie 字符串或 Cookie 对象数组 |
@@ -227,8 +231,10 @@ curl -X POST http://localhost:3000/fetch-file \
 |------|------|------|
 | `url` | `string` | 触发下载的页面 URL，必填 |
 | `fileUrl` | `string` | 目标文件 URL，必填。传入 `_any_` 表示抓取页面中的任意网络资源 |
+| `waitFor` | `string` | 等待时机：`load` / `domcontentloaded` / `networkidle0` / `networkidle2` |
 | `timeout` | `number` | 超时毫秒数，默认 `20000` |
 | `cookies` | `string \| object[]` | Cookie 字符串或 Cookie 对象数组 |
+| `maxBytes` | `number` | 本次请求的文件大小上限，不能超过服务端 `MAX_FETCH_FILE_BYTES` |
 
 ### 返回说明
 

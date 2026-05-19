@@ -1,5 +1,30 @@
 const { withPage } = require('./browser-pool');
 
+function createPayloadTooLargeError(maxBytes) {
+  const error = new Error(`目标文件超过大小限制，最大允许 ${maxBytes} 字节`);
+  error.statusCode = 413;
+  return error;
+}
+
+function normalizeMaxBytes(maxBytes) {
+  const parsedValue = Number(maxBytes);
+  return Number.isFinite(parsedValue) && parsedValue > 0 ? parsedValue : null;
+}
+
+function parseContentLength(headers) {
+  const rawValue = headers['content-length'];
+  if (rawValue == null || rawValue === '') {
+    return null;
+  }
+
+  const parsedValue = Number.parseInt(rawValue, 10);
+  return Number.isFinite(parsedValue) && parsedValue >= 0 ? parsedValue : null;
+}
+
+function exceedsMaxBytes(size, maxBytes) {
+  return maxBytes != null && size != null && size > maxBytes;
+}
+
 async function injectCookies(page, url, cookies) {
   if (!cookies) {
     return;
@@ -44,6 +69,40 @@ function createAsyncTaskTracker() {
   };
 }
 
+function shouldBlockRequest(request, blockedResourceTypes, blockedUrlPatterns) {
+  const resourceType = request.resourceType();
+  const requestUrl = request.url();
+
+  return blockedResourceTypes.has(resourceType)
+    || blockedUrlPatterns.some((pattern) => requestUrl.includes(pattern));
+}
+
+async function applyRequestBlocking(page, {
+  blockedResourceTypes = [],
+  blockedUrlPatterns = [],
+} = {}) {
+  const resourceTypeSet = new Set(blockedResourceTypes.filter(Boolean));
+  const urlPatterns = blockedUrlPatterns.filter(Boolean);
+
+  if (resourceTypeSet.size === 0 && urlPatterns.length === 0) {
+    return;
+  }
+
+  await page.setRequestInterception(true);
+  page.on('request', async (request) => {
+    try {
+      if (shouldBlockRequest(request, resourceTypeSet, urlPatterns)) {
+        await request.abort();
+        return;
+      }
+
+      await request.continue();
+    } catch {
+      // 请求可能已经被 Chromium 取消，忽略单个资源的拦截失败以保证主流程继续。
+    }
+  });
+}
+
 async function renderPage(pool, {
   url,
   waitFor,
@@ -85,9 +144,12 @@ async function screenshotPage(pool, {
   quality,
   clip,
   viewport = { width: 1440, height: 900, deviceScaleFactor: 1 },
+  blockedResourceTypes = [],
+  blockedUrlPatterns = [],
 }) {
   return withPage(pool, async (page) => {
     await page.setViewport(viewport);
+    await applyRequestBlocking(page, { blockedResourceTypes, blockedUrlPatterns });
 
     if (Object.keys(headers).length > 0) {
       await page.setExtraHTTPHeaders(headers);
@@ -119,7 +181,7 @@ async function screenshotPage(pool, {
 }
 
 async function interceptRequests(pool, {
-  url, listenUrls = [], fileTypes = [], timeout = 20000, headers = {}, cookies,
+  url, waitFor, listenUrls = [], fileTypes = [], timeout = 20000, headers = {}, cookies,
 }) {
   return withPage(pool, async (page) => {
     const captured = [];
@@ -179,17 +241,21 @@ async function interceptRequests(pool, {
     }
 
     await injectCookies(page, url, cookies);
-    await page.goto(url, { waitUntil: 'networkidle2', timeout });
+    await page.goto(url, { waitUntil: waitFor || 'networkidle2', timeout });
     await tracker.waitForIdle();
 
     return { finalUrl: page.url(), captured, files };
   });
 }
 
-async function fetchFile(pool, { url, fileUrl, timeout = 20000, cookies }) {
+async function fetchFile(pool, {
+  url, fileUrl, waitFor, timeout = 20000, cookies, maxBytes,
+}) {
   return withPage(pool, async (page) => {
     let fileBuffer = null;
     let contentType = '';
+    let fileError = null;
+    const normalizedMaxBytes = normalizeMaxBytes(maxBytes);
     const tracker = createAsyncTaskTracker();
 
     await page.setRequestInterception(true);
@@ -199,13 +265,27 @@ async function fetchFile(pool, { url, fileUrl, timeout = 20000, cookies }) {
       tracker.track((async () => {
         const matched = response.url() === fileUrl || fileUrl === '_any_';
 
-        if (!matched || fileBuffer) {
+        if (!matched || fileBuffer || fileError) {
           return;
         }
 
         try {
-          fileBuffer = await response.buffer();
-          contentType = response.headers()['content-type'] || 'application/octet-stream';
+          const headers = response.headers();
+          const contentLength = parseContentLength(headers);
+
+          if (exceedsMaxBytes(contentLength, normalizedMaxBytes)) {
+            fileError = createPayloadTooLargeError(normalizedMaxBytes);
+            return;
+          }
+
+          const buffer = await response.buffer();
+          if (exceedsMaxBytes(buffer.length, normalizedMaxBytes)) {
+            fileError = createPayloadTooLargeError(normalizedMaxBytes);
+            return;
+          }
+
+          fileBuffer = buffer;
+          contentType = headers['content-type'] || 'application/octet-stream';
         } catch {
           fileBuffer = null;
           contentType = '';
@@ -214,15 +294,21 @@ async function fetchFile(pool, { url, fileUrl, timeout = 20000, cookies }) {
     });
 
     await injectCookies(page, url, cookies);
-    await page.goto(url, { waitUntil: 'networkidle2', timeout });
+    await page.goto(url, { waitUntil: waitFor || 'networkidle2', timeout });
     await tracker.waitForIdle();
+
+    if (fileError) {
+      throw fileError;
+    }
 
     return { buffer: fileBuffer, contentType };
   });
 }
 
 module.exports = {
+  applyRequestBlocking,
   createAsyncTaskTracker,
+  createPayloadTooLargeError,
   fetchFile,
   injectCookies,
   interceptRequests,

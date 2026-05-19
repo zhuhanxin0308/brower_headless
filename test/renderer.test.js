@@ -337,6 +337,54 @@ test('screenshotPage 对 png 格式不设置 quality', async () => {
   }
 });
 
+test('screenshotPage 会中止被配置阻断的资源请求', async () => {
+  const listeners = new Map();
+  const requestActions = [];
+  let interceptionEnabled = false;
+
+  function createRequest(url, resourceType) {
+    return {
+      url() { return url; },
+      resourceType() { return resourceType; },
+      async abort() { requestActions.push(`abort:${resourceType}:${url}`); },
+      async continue() { requestActions.push(`continue:${resourceType}:${url}`); },
+    };
+  }
+
+  const page = {
+    async setViewport() {},
+    async setExtraHTTPHeaders() {},
+    async setRequestInterception(value) { interceptionEnabled = value; },
+    on(event, handler) { listeners.set(event, handler); },
+    async goto() {
+      const handler = listeners.get('request');
+      assert.equal(typeof handler, 'function');
+      await handler(createRequest('https://cdn.example.com/video.mp4', 'media'));
+      await handler(createRequest('https://analytics.example.com/pixel.gif', 'image'));
+      await handler(createRequest('https://example.com/index.html', 'document'));
+    },
+    async screenshot() { return Buffer.from('img'); },
+  };
+
+  const { renderer, restore } = loadRendererWithPage(page);
+  try {
+    await renderer.screenshotPage(null, {
+      url: 'https://example.com',
+      blockedResourceTypes: ['media'],
+      blockedUrlPatterns: ['analytics.example.com'],
+    });
+
+    assert.equal(interceptionEnabled, true);
+    assert.deepEqual(requestActions, [
+      'abort:media:https://cdn.example.com/video.mp4',
+      'abort:image:https://analytics.example.com/pixel.gif',
+      'continue:document:https://example.com/index.html',
+    ]);
+  } finally {
+    restore();
+  }
+});
+
 // ====== interceptRequests ======
 
 test('interceptRequests 会等待异步响应体读取完成后再返回', async () => {
@@ -370,6 +418,34 @@ test('interceptRequests 会等待异步响应体读取完成后再返回', async
 
     assert.equal(result.captured.length, 1);
     assert.deepEqual(result.captured[0].body, { ok: true });
+  } finally {
+    restore();
+  }
+});
+
+test('interceptRequests 会透传自定义 waitFor', async () => {
+  let gotoOptions = null;
+  const page = {
+    async setRequestInterception() {},
+    on() {},
+    async goto(_url, opts) {
+      gotoOptions = opts;
+    },
+    url() {
+      return 'https://example.com/final';
+    },
+  };
+
+  const { renderer, restore } = loadRendererWithPage(page);
+
+  try {
+    await renderer.interceptRequests(null, {
+      url: 'https://example.com',
+      waitFor: 'domcontentloaded',
+      timeout: 1000,
+    });
+
+    assert.equal(gotoOptions.waitUntil, 'domcontentloaded');
   } finally {
     restore();
   }
@@ -414,6 +490,107 @@ test('interceptRequests 会按 fileTypes 筛选资源文件', async () => {
 });
 
 // ====== fetchFile ======
+
+test('fetchFile 会透传自定义 waitFor', async () => {
+  let gotoOptions = null;
+  const page = {
+    async setRequestInterception() {},
+    on() {},
+    async goto(_url, opts) {
+      gotoOptions = opts;
+    },
+  };
+
+  const { renderer, restore } = loadRendererWithPage(page);
+
+  try {
+    await renderer.fetchFile(null, {
+      url: 'https://example.com',
+      fileUrl: 'https://cdn.example.com/file.bin',
+      waitFor: 'domcontentloaded',
+      timeout: 1000,
+    });
+
+    assert.equal(gotoOptions.waitUntil, 'domcontentloaded');
+  } finally {
+    restore();
+  }
+});
+
+test('fetchFile 在 content-length 超过 maxBytes 时拒绝读取文件', async () => {
+  const listeners = new Map();
+  let bufferCalled = false;
+  const page = {
+    async setRequestInterception() {},
+    on(event, handler) {
+      listeners.set(event, handler);
+    },
+    async goto() {
+      const handler = listeners.get('response');
+      handler({
+        url() { return 'https://cdn.example.com/large.bin'; },
+        headers() {
+          return {
+            'content-type': 'application/octet-stream',
+            'content-length': '2048',
+          };
+        },
+        async buffer() {
+          bufferCalled = true;
+          return Buffer.alloc(2048);
+        },
+      });
+    },
+  };
+
+  const { renderer, restore } = loadRendererWithPage(page);
+  try {
+    await assert.rejects(
+      () => renderer.fetchFile(null, {
+        url: 'https://example.com',
+        fileUrl: 'https://cdn.example.com/large.bin',
+        maxBytes: 1024,
+      }),
+      (error) => error.statusCode === 413 && /超过大小限制/.test(error.message),
+    );
+    assert.equal(bufferCalled, false);
+  } finally {
+    restore();
+  }
+});
+
+test('fetchFile 在实际缓冲区超过 maxBytes 时抛出 413', async () => {
+  const listeners = new Map();
+  const page = {
+    async setRequestInterception() {},
+    on(event, handler) {
+      listeners.set(event, handler);
+    },
+    async goto() {
+      const handler = listeners.get('response');
+      handler(createResponse({
+        url: 'https://cdn.example.com/file.bin',
+        contentType: 'application/octet-stream',
+        body: 'payload',
+        delay: 0,
+      }));
+    },
+  };
+
+  const { renderer, restore } = loadRendererWithPage(page);
+  try {
+    await assert.rejects(
+      () => renderer.fetchFile(null, {
+        url: 'https://example.com',
+        fileUrl: 'https://cdn.example.com/file.bin',
+        maxBytes: 4,
+      }),
+      (error) => error.statusCode === 413 && /超过大小限制/.test(error.message),
+    );
+  } finally {
+    restore();
+  }
+});
 
 test('fetchFile 会等待文件缓冲区读取完成后再返回', async () => {
   const listeners = new Map();

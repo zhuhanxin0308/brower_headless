@@ -7,7 +7,24 @@ const { createStatsStore } = require('./stats-store');
 const { assertAllowedUrl } = require('./url-security');
 
 const DEFAULT_BODY_LIMIT = 1048576;
+const DEFAULT_MAX_FETCH_FILE_BYTES = 50 * 1024 * 1024;
 const DASHBOARD_PUBLIC_PATHS = new Set(['/', '/favicon.ico']);
+const WAIT_FOR_SCHEMA = { type: 'string', enum: ['load', 'domcontentloaded', 'networkidle0', 'networkidle2'] };
+const BLOCKABLE_RESOURCE_TYPES = [
+  'document',
+  'stylesheet',
+  'image',
+  'media',
+  'font',
+  'script',
+  'texttrack',
+  'xhr',
+  'fetch',
+  'eventsource',
+  'websocket',
+  'manifest',
+  'other',
+];
 
 // 统一解析布尔环境变量，避免在各处手写大小写判断。
 function parseBoolean(value, defaultValue = false) {
@@ -21,6 +38,20 @@ function parseBoolean(value, defaultValue = false) {
 function parseInteger(value, defaultValue) {
   const parsedValue = Number.parseInt(value, 10);
   return Number.isNaN(parsedValue) ? defaultValue : parsedValue;
+}
+
+function parsePositiveInteger(value, defaultValue) {
+  const parsedValue = Number.parseInt(value, 10);
+  return Number.isFinite(parsedValue) && parsedValue > 0 ? parsedValue : defaultValue;
+}
+
+function resolveFetchFileMaxBytes(requestMaxBytes, serverMaxBytes) {
+  if (requestMaxBytes == null) {
+    return serverMaxBytes;
+  }
+
+  // 调用方只能收紧限制，不能绕过服务端的全局保护阈值。
+  return Math.min(parsePositiveInteger(requestMaxBytes, serverMaxBytes), serverMaxBytes);
 }
 
 function normalizeRequestPath(rawUrl = '/') {
@@ -89,6 +120,8 @@ function buildApp(options = {}) {
   const allowPrivateNetwork = options.allowPrivateNetwork ?? parseBoolean(process.env.ALLOW_PRIVATE_NETWORK, false);
   const minBrowsers = parseInteger(process.env.MIN_BROWSERS, 2);
   const maxBrowsers = parseInteger(process.env.MAX_BROWSERS, 10);
+  const maxFetchFileBytes = options.maxFetchFileBytes
+    ?? parsePositiveInteger(process.env.MAX_FETCH_FILE_BYTES, DEFAULT_MAX_FETCH_FILE_BYTES);
   // 最大排队深度：允许最多 maxBrowsers 个请求在池中等待，超过后快速拒绝。
   const maxPendingAcquires = options.maxPendingAcquires ?? maxBrowsers;
   const browserPoolFactory = options.browserPoolFactory ?? (() => createBrowserPool({
@@ -199,7 +232,7 @@ function buildApp(options = {}) {
         required: ['url'],
         properties: {
           url: { type: 'string' },
-          waitFor: { type: 'string', enum: ['load', 'domcontentloaded', 'networkidle0', 'networkidle2'] },
+          waitFor: WAIT_FOR_SCHEMA,
           timeout: { type: 'number', default: 15000 },
           headers: { type: 'object', additionalProperties: { type: 'string' } },
           cookies: cookieSchema,
@@ -235,7 +268,7 @@ function buildApp(options = {}) {
         required: ['url'],
         properties: {
           url: { type: 'string' },
-          waitFor: { type: 'string', enum: ['load', 'domcontentloaded', 'networkidle0', 'networkidle2'] },
+          waitFor: WAIT_FOR_SCHEMA,
           timeout: { type: 'number', default: 20000 },
           headers: { type: 'object', additionalProperties: { type: 'string' } },
           cookies: cookieSchema,
@@ -260,11 +293,34 @@ function buildApp(options = {}) {
               deviceScaleFactor: { type: 'number', default: 1 },
             },
           },
+          blockedResourceTypes: {
+            type: 'array',
+            items: { type: 'string', enum: BLOCKABLE_RESOURCE_TYPES },
+            default: [],
+          },
+          blockedUrlPatterns: {
+            type: 'array',
+            items: { type: 'string' },
+            default: [],
+          },
         },
       },
     },
   }, async (req, reply) => {
-    const { url, waitFor, timeout, headers, cookies, format, fullPage, quality, clip, viewport } = req.body;
+    const {
+      url,
+      waitFor,
+      timeout,
+      headers,
+      cookies,
+      format,
+      fullPage,
+      quality,
+      clip,
+      viewport,
+      blockedResourceTypes,
+      blockedUrlPatterns,
+    } = req.body;
 
     try {
       ensurePoolCapacity(pool, maxPendingAcquires);
@@ -280,6 +336,8 @@ function buildApp(options = {}) {
         quality,
         clip,
         viewport,
+        blockedResourceTypes,
+        blockedUrlPatterns,
       });
 
       reply.header('Content-Type', contentType);
@@ -298,6 +356,7 @@ function buildApp(options = {}) {
         required: ['url'],
         properties: {
           url: { type: 'string' },
+          waitFor: WAIT_FOR_SCHEMA,
           listenUrls: { type: 'array', items: { type: 'string' }, default: [] },
           fileTypes: {
             type: 'array',
@@ -311,12 +370,20 @@ function buildApp(options = {}) {
       },
     },
   }, async (req, reply) => {
-    const { url, listenUrls, fileTypes, timeout, headers, cookies } = req.body;
+    const { url, waitFor, listenUrls, fileTypes, timeout, headers, cookies } = req.body;
 
     try {
       ensurePoolCapacity(pool, maxPendingAcquires);
       await validateTargetUrl(url);
-      const result = await rendererApi.interceptRequests(pool, { url, listenUrls, fileTypes, timeout, headers, cookies });
+      const result = await rendererApi.interceptRequests(pool, {
+        url,
+        waitFor,
+        listenUrls,
+        fileTypes,
+        timeout,
+        headers,
+        cookies,
+      });
       return { ok: true, ...result };
     } catch (error) {
       req.requestErrorMessage = error.message;
@@ -333,13 +400,15 @@ function buildApp(options = {}) {
           url: { type: 'string' },
           // 传入 '_any_' 表示抓取页面中的任意网络资源。
           fileUrl: { type: 'string' },
+          waitFor: WAIT_FOR_SCHEMA,
           timeout: { type: 'number', default: 20000 },
           cookies: cookieSchema,
+          maxBytes: { type: 'number', minimum: 1 },
         },
       },
     },
   }, async (req, reply) => {
-    const { url, fileUrl, timeout, cookies } = req.body;
+    const { url, fileUrl, waitFor, timeout, cookies, maxBytes } = req.body;
 
     try {
       ensurePoolCapacity(pool, maxPendingAcquires);
@@ -349,7 +418,14 @@ function buildApp(options = {}) {
         await validateTargetUrl(fileUrl);
       }
 
-      const { buffer, contentType } = await rendererApi.fetchFile(pool, { url, fileUrl, timeout, cookies });
+      const { buffer, contentType } = await rendererApi.fetchFile(pool, {
+        url,
+        fileUrl,
+        waitFor,
+        timeout,
+        cookies,
+        maxBytes: resolveFetchFileMaxBytes(maxBytes, maxFetchFileBytes),
+      });
 
       if (!buffer) {
         req.requestErrorMessage = '未找到目标文件';
@@ -381,5 +457,7 @@ module.exports = {
   ensurePoolCapacity,
   parseBoolean,
   parseInteger,
+  parsePositiveInteger,
+  resolveFetchFileMaxBytes,
   safeEqual,
 };
