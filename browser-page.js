@@ -1,3 +1,6 @@
+const { stopPrewarm } = require('./browser-prewarm');
+const { waitForPageInitialization, stopContextInitialization, stopBrowserInitialization } = require('./browser-initialization');
+
 const DEFAULT_CLEANUP_TIMEOUT_MS = 5000;
 const FORCE_KILL_TIMEOUT_MS = 1000;
 const browserClosures = new WeakMap();
@@ -52,13 +55,32 @@ function closeBrowser(browser, { cleanupTimeoutMillis = DEFAULT_CLEANUP_TIMEOUT_
   // 池的 destroy 立即返回；共享同一关闭任务，才能等到实际浏览器资源收尾。
   const closing = (async () => {
     const child = browser.process?.();
+    let browserCloseStarted = false;
+    let closingInterrupted = false;
     try {
-      await bounded(() => browser.close(), cleanupTimeoutMillis, '浏览器关闭超时');
+      await bounded(async () => {
+        const initialization = stopBrowserInitialization(browser);
+        await stopPrewarm(browser);
+        await initialization;
+        if (closingInterrupted) return;
+        browserCloseStarted = true;
+        await browser.close();
+      }, cleanupTimeoutMillis, '浏览器关闭超时');
     } catch (error) {
+      closingInterrupted = true;
       if (child) {
         await terminateProcess(child);
-      } else if (!browser.isConnected || browser.isConnected()) {
-        throw error;
+      } else {
+        if (!browserCloseStarted) {
+          // 初始化永久悬挂时仍须尝试关闭整个浏览器，不能仅让等待超时后释放真实资源的责任。
+          try {
+            await bounded(() => browser.close(), FORCE_KILL_TIMEOUT_MS, '预热异常后的浏览器关闭超时');
+            return;
+          } catch (cleanupError) {
+            attachCleanupError(error, cleanupError);
+          }
+        }
+        if (!browser.isConnected || browser.isConnected()) throw error;
       }
     }
   })();
@@ -195,9 +217,19 @@ async function withPage(pool, fn, { signal, cleanupTimeoutMillis = DEFAULT_CLEAN
 
   try {
     // 每个请求始终使用独立上下文，创建页面失败也必须关闭已经创建的上下文。
-    context = await abortable(() => browser.createBrowserContext(), signal, closeLateResource);
-    phase = 'page';
-    const page = await abortable(() => context.newPage(), signal, closeLateResource);
+    let page;
+    if (pool.takePreparedPage) {
+      const prepared = await abortable(() => pool.takePreparedPage(browser, signal), signal, (latePrepared) => {
+        if (latePrepared) closeLateResource(latePrepared.context);
+      });
+      if (prepared) ({ context, page } = prepared);
+    }
+    if (!context) {
+      context = await abortable(() => browser.createBrowserContext(), signal, closeLateResource);
+      phase = 'page';
+      page = await abortable(() => context.newPage(), signal, closeLateResource);
+      await abortable(() => waitForPageInitialization(page), signal);
+    }
     phase = 'running';
     result = await abortable(() => fn(page, context), signal);
   } catch (error) {
@@ -208,11 +240,20 @@ async function withPage(pool, fn, { signal, cleanupTimeoutMillis = DEFAULT_CLEAN
 
   if (context) {
     try {
-      await bounded(() => context.close(), cleanupTimeoutMillis, '浏览器上下文清理超时');
+      await bounded(async () => {
+        await stopContextInitialization(context, browser);
+        await context.close();
+      }, cleanupTimeoutMillis, '浏览器上下文清理超时');
     } catch (error) {
       retainFirstError(error);
       discardBrowser = true;
     }
+  }
+
+  const prewarmFailure = pool.finishPreparedPage?.(browser, { discard: discardBrowser });
+  if (prewarmFailure) {
+    retainFirstError(prewarmFailure.error);
+    discardBrowser = true;
   }
 
   try {

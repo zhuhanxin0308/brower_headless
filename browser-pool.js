@@ -1,10 +1,12 @@
 const puppeteerCore = require('puppeteer-core');
 const { addExtra } = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const UserAgentOverridePlugin = require('puppeteer-extra-plugin-stealth/evasions/user-agent-override');
+const { createUserAgentPlugin } = require('./browser-user-agent');
+const { createInitializationPlugin } = require('./browser-initialization');
 const { createPool } = require('generic-pool');
-const { closeBrowser, DEFAULT_CLEANUP_TIMEOUT_MS, withPage } = require('./browser-page');
+const { bounded, closeBrowser, DEFAULT_CLEANUP_TIMEOUT_MS, withPage } = require('./browser-page');
 const { createAdmissionPool } = require('./browser-pool-admission');
+const { initializePrewarm, pausePrewarm, takePreparedPage, finishPreparedPage, unsafePrewarmError } = require('./browser-prewarm');
 
 const DEFAULT_MIN_BROWSERS = 2;
 const DEFAULT_MAX_BROWSERS = 10;
@@ -71,11 +73,12 @@ function createStealthPuppeteer(userAgent) {
   stealthPlugin.enabledEvasions.delete('user-agent-override');
 
   puppeteer.use(stealthPlugin);
-  puppeteer.use(UserAgentOverridePlugin({
+  puppeteer.use(createUserAgentPlugin({
     userAgent,
     locale: 'zh-CN,zh;q=0.9,en;q=0.8',
     maskLinux: true,
   }));
+  puppeteer.use(createInitializationPlugin(puppeteer));
 
   return puppeteer;
 }
@@ -89,6 +92,7 @@ function createBrowserPool(options = {}) {
     softIdleTimeoutMillis = DEFAULT_SOFT_IDLE_TIMEOUT_MS,
     evictionRunIntervalMillis = DEFAULT_EVICTION_INTERVAL_MS,
     cleanupTimeoutMillis = DEFAULT_CLEANUP_TIMEOUT_MS,
+    prewarmPages = true,
     executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
     launchBrowser = async () => {
       const puppeteer = createStealthPuppeteer(randomUA());
@@ -104,15 +108,40 @@ function createBrowserPool(options = {}) {
   assertIntegerOption('maxBrowsers', maxBrowsers, 1);
   assertIntegerOption('minBrowsers', minBrowsers, 0, maxBrowsers);
   assertIntegerOption('maxPendingAcquires', maxPendingAcquires, 0);
+  if (typeof prewarmPages !== 'boolean') throw new TypeError('prewarmPages 必须是布尔值');
   for (const [name, value] of Object.entries({ acquireTimeoutMillis, softIdleTimeoutMillis, evictionRunIntervalMillis, cleanupTimeoutMillis })) {
     assertIntegerOption(name, value, 1, MAX_TIMER_DELAY_MS);
   }
 
+  const browsers = new Set();
+  let stopping = false;
+  let pool;
   const factory = {
-    create: launchBrowser,
-    destroy: (browser) => closeBrowser(browser, { cleanupTimeoutMillis }),
+    create: async () => {
+      const browser = await launchBrowser();
+      browsers.add(browser);
+      if (prewarmPages && !stopping) {
+        await initializePrewarm(browser, {
+          bounded,
+          cleanupTimeoutMillis,
+          preparationTimeoutMillis: acquireTimeoutMillis,
+          reportError: (error) => pool.emit('factoryCreateError', error),
+          closeBrowser: (value) => closeBrowser(value, { cleanupTimeoutMillis }),
+        });
+      }
+      return browser;
+    },
+    destroy: async (browser) => {
+      try {
+        await closeBrowser(browser, { cleanupTimeoutMillis });
+      } finally {
+        browsers.delete(browser);
+      }
+    },
     validate: async (browser) => {
       try {
+        // 不确定的预热失败交给当前借用报错并淘汰，避免工厂验证反复补建失败实例。
+        if (unsafePrewarmError(browser)) return true;
         return browser.isConnected();
       } catch {
         return false;
@@ -120,7 +149,7 @@ function createBrowserPool(options = {}) {
     },
   };
 
-  const pool = createPool(factory, {
+  pool = createPool(factory, {
     min: minBrowsers,
     max: maxBrowsers,
     // 底层至少容纳所有启动中的浏览器；业务等待上限由外部可取消队列统一执行。
@@ -132,13 +161,26 @@ function createBrowserPool(options = {}) {
     idleTimeoutMillis: DISABLED_HARD_IDLE_TIMEOUT_MS,
     evictionRunIntervalMillis,
   });
-  return createAdmissionPool(pool, {
+  const adapter = createAdmissionPool(pool, {
     maxBrowsers,
     maxPendingAcquires,
     acquireTimeoutMillis,
     cleanupTimeoutMillis,
     closeAbandonedBrowser: (browser) => closeBrowser(browser, { cleanupTimeoutMillis }),
   });
+  if (prewarmPages) {
+    adapter.takePreparedPage = takePreparedPage;
+    adapter.finishPreparedPage = finishPreparedPage;
+    const stopReplenishing = () => {
+      stopping = true;
+      for (const browser of browsers) pausePrewarm(browser);
+    };
+    for (const method of ['drain', 'clear']) {
+      const original = adapter[method];
+      adapter[method] = () => { stopReplenishing(); return original(); };
+    }
+  }
+  return adapter;
 }
 
 module.exports = {

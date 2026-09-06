@@ -8,6 +8,7 @@ services:
       - API_KEY=your-secret-key        # 建议修改
       - MIN_BROWSERS=2                  # 最少保持的浏览器数
       - MAX_BROWSERS=10                 # 最多并发浏览器数
+      - PREWARM_PAGES=true              # 每个浏览器预建一个独立页面，以额外内存降低响应延迟
       - MAX_FETCH_FILE_BYTES=52428800    # /fetch-file 单次文件最大字节数
       - PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
     deploy:

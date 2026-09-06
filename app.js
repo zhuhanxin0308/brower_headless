@@ -126,6 +126,7 @@ function buildApp(options = {}) {
   const allowPrivateNetwork = options.allowPrivateNetwork ?? parseBoolean(process.env.ALLOW_PRIVATE_NETWORK, false);
   const minBrowsers = options.minBrowsers ?? parseInteger(process.env.MIN_BROWSERS, 2);
   const maxBrowsers = options.maxBrowsers ?? parseInteger(process.env.MAX_BROWSERS, 10);
+  const prewarmPages = options.prewarmPages ?? parseBoolean(process.env.PREWARM_PAGES, true);
   const maxFetchFileBytes = options.maxFetchFileBytes
     ?? parsePositiveInteger(process.env.MAX_FETCH_FILE_BYTES, DEFAULT_MAX_FETCH_FILE_BYTES);
   // 最大排队深度：允许最多 maxBrowsers 个请求在池中等待，超过后快速拒绝。
@@ -138,10 +139,14 @@ function buildApp(options = {}) {
   validateCapacity('MAX_BROWSERS', maxBrowsers, 1);
   validateCapacity('MAX_PENDING_ACQUIRES', maxPendingAcquires, 0);
   validateCapacity('MAX_PENDING_FILE_RESPONSES', maxPendingFileResponses, 1);
+  if (typeof prewarmPages !== 'boolean') {
+    throw new TypeError('PREWARM_PAGES 必须是布尔值');
+  }
   const browserPoolFactory = options.browserPoolFactory ?? (() => createBrowserPool({
     minBrowsers,
     maxBrowsers,
     maxPendingAcquires,
+    prewarmPages,
   }));
   const rendererApi = options.rendererApi ?? rendererApiDefault;
   const statsStore = options.statsStore ?? createStatsStore();

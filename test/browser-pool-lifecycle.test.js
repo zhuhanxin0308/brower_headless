@@ -48,6 +48,7 @@ function createBrowser(overrides = {}) {
 function createTestPool(t, options = {}) {
   const launched = [];
   const pool = createBrowserPool({
+    prewarmPages: false,
     minBrowsers: 0,
     maxBrowsers: 1,
     maxPendingAcquires: 1,

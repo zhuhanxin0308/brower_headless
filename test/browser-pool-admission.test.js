@@ -24,6 +24,7 @@ function browserStub(overrides = {}) {
 function testPool(t, options = {}) {
   const browsers = [];
   const pool = createBrowserPool({
+    prewarmPages: false,
     minBrowsers: 0,
     maxBrowsers: 1,
     maxPendingAcquires: 1,
@@ -161,7 +162,7 @@ test('失联浏览器被验证淘汰后自动创建可用替代实例', async (t
 test('适配器保留资源销毁失败事件且排空显式报告被隔离资源', async () => {
   const failure = new Error('浏览器关闭失败');
   const browser = browserStub({ async close() { throw failure; } });
-  const pool = createBrowserPool({ minBrowsers: 0, maxBrowsers: 1, launchBrowser: async () => browser });
+  const pool = createBrowserPool({ prewarmPages: false, minBrowsers: 0, maxBrowsers: 1, launchBrowser: async () => browser });
   const errors = [];
   pool.on('factoryDestroyError', (error) => errors.push(error));
   const borrowed = await pool.acquire();

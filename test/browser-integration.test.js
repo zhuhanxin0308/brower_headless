@@ -1,6 +1,9 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
+const path = require('node:path');
+const { execFile } = require('node:child_process');
+const { promisify } = require('node:util');
 const { setTimeout: delay } = require('node:timers/promises');
 const { createBrowserPool } = require('../browser-pool');
 const { buildApp } = require('../app');
@@ -9,12 +12,99 @@ const executablePath = process.env.BROWSER_TEST_EXECUTABLE;
 const TEST_TIMEOUT_MS = 30000;
 const OPERATION_TIMEOUT_MS = 5000;
 const POLL_INTERVAL_MS = 10;
+const SHUTDOWN_REPETITIONS = 8;
+const SHUTDOWN_TIMEOUT_MS = 60000;
 
 async function waitUntil(predicate) {
   const deadline = performance.now() + OPERATION_TIMEOUT_MS;
   while (!predicate() && performance.now() < deadline) await delay(POLL_INTERVAL_MS);
   assert.equal(predicate(), true, '浏览器资源未在限定时间内到达预期状态');
 }
+
+test('真实 Chromium 默认页面预热及关闭配置通过应用入口生效', {
+  skip: !executablePath,
+  timeout: TEST_TIMEOUT_MS,
+}, async (t) => {
+  const previousExecutable = process.env.PUPPETEER_EXECUTABLE_PATH;
+  const previousPrewarm = process.env.PREWARM_PAGES;
+  process.env.PUPPETEER_EXECUTABLE_PATH = executablePath;
+  t.after(() => {
+    if (previousExecutable == null) delete process.env.PUPPETEER_EXECUTABLE_PATH;
+    else process.env.PUPPETEER_EXECUTABLE_PATH = previousExecutable;
+    if (previousPrewarm == null) delete process.env.PREWARM_PAGES;
+    else process.env.PREWARM_PAGES = previousPrewarm;
+  });
+
+  for (const scenario of [
+    { name: '默认启用', expectedPages: 1 },
+    { name: '环境变量关闭', environment: 'false', expectedPages: 0 },
+    { name: '显式配置覆盖环境变量', environment: 'false', option: true, expectedPages: 1 },
+  ]) {
+    await t.test(scenario.name, async () => {
+      if (scenario.environment == null) delete process.env.PREWARM_PAGES;
+      else process.env.PREWARM_PAGES = scenario.environment;
+      const app = buildApp({ logger: false, apiKey: '', allowPrivateNetwork: true,
+        minBrowsers: 0, maxBrowsers: 1, prewarmPages: scenario.option,
+        rendererApi: { async renderPage(pool) {
+          const browser = await pool.acquire();
+          try {
+            const contexts = browser.browserContexts().filter((context) => context !== browser.defaultBrowserContext());
+            const pages = (await Promise.all(contexts.map((context) => context.pages()))).flat();
+            return { contextCount: contexts.length, pageUrls: pages.map((page) => page.url()) };
+          } finally {
+            await pool.release(browser);
+          }
+        } },
+      });
+      try {
+        const result = await app.inject({ method: 'POST', url: '/render',
+          payload: { url: 'http://localhost', totalTimeout: OPERATION_TIMEOUT_MS } });
+        assert.equal(result.statusCode, 200, result.body);
+        assert.equal(result.json().contextCount, scenario.expectedPages);
+        assert.deepEqual(result.json().pageUrls, Array(scenario.expectedPages).fill('about:blank'));
+      } finally {
+        await app.close();
+      }
+    });
+  }
+});
+
+test('真实 Chromium 并发预热立即关闭时无插件报错或未处理拒绝', {
+  skip: !executablePath,
+  timeout: SHUTDOWN_TIMEOUT_MS,
+}, async () => {
+  // 独立进程同时检查退出码和 stderr，防止插件自行打印异常却让测试表面通过。
+  const script = `
+    const assert = require('node:assert/strict');
+    const { createBrowserPool, withPage } = require('./browser-pool');
+    (async () => {
+      for (let iteration = 0; iteration < ${SHUTDOWN_REPETITIONS}; iteration++) {
+        const pool = createBrowserPool({
+          executablePath: process.env.BROWSER_TEST_EXECUTABLE,
+          minBrowsers: 0, maxBrowsers: 2,
+        });
+        const browsers = new Set();
+        try {
+          await Promise.all(Array.from({ length: 2 }, () => withPage(pool, async (page) => {
+            browsers.add(page.browser());
+            await page.goto('data:text/html,<title>初始化关闭验证</title>', { waitUntil: 'load' });
+          })));
+        } finally {
+          await pool.drain();
+          await pool.clear();
+        }
+        for (const browser of browsers) assert.equal(browser.isConnected(), false);
+      }
+      process.stdout.write('CLEAN_SHUTDOWN');
+    })().catch((error) => { console.error(error); process.exitCode = 1; });
+  `;
+  const { stdout, stderr } = await promisify(execFile)(process.execPath, ['-e', script], {
+    cwd: path.resolve(__dirname, '..'),
+    timeout: SHUTDOWN_TIMEOUT_MS,
+  });
+  assert.equal(stdout, 'CLEAN_SHUTDOWN');
+  assert.ok(!stderr.trim(), stderr.slice(0, 2000));
+});
 
 test('真实 Chromium 验证渲染、隔离、截图、捕获和超时后资源恢复', {
   skip: !executablePath,

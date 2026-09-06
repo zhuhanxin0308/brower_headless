@@ -35,6 +35,12 @@ test('非法容量配置在接收请求前失败，避免关闭准入保护', ()
   }
 });
 
+test('页面预热配置拒绝会被误判为启用的非布尔值', () => {
+  for (const prewarmPages of ['false', 0, 1, {}, []]) {
+    assert.throws(() => buildApp({ logger: false, prewarmPages }), /PREWARM_PAGES/);
+  }
+});
+
 test('关闭服务时排空失败仍清理空闲实例并保留原始错误', async (t) => {
   for (const clearFails of [false, true]) {
     await t.test(clearFails ? '空闲清理也失败' : '空闲清理成功', async () => {

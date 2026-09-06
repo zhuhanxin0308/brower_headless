@@ -58,6 +58,7 @@ test('真实池销毁必须等旧浏览器关闭后才放行下一业务', async
     },
   });
   const pool = createBrowserPool({
+    prewarmPages: false,
     minBrowsers: 0,
     maxBrowsers: 1,
     maxPendingAcquires: 1,
