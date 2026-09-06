@@ -124,9 +124,9 @@ test('ensurePoolCapacity 在排队未超限时正常通过', () => {
   assert.doesNotThrow(() => ensurePoolCapacity(pool, 10));
 });
 
-test('ensurePoolCapacity 在排队等于上限时正常通过', () => {
+test('ensurePoolCapacity 在排队等于上限且没有空闲实例时拒绝新请求', () => {
   const pool = createPoolStub({ pending: 10 });
-  assert.doesNotThrow(() => ensurePoolCapacity(pool, 10));
+  assert.throws(() => ensurePoolCapacity(pool, 10), (error) => error.statusCode === 503);
 });
 
 // ====== API Key 鉴权 ======

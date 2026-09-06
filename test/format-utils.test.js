@@ -1,5 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { spawnSync } = require('node:child_process');
 
 const {
   escapeHtml,
@@ -95,6 +96,50 @@ test('formatTime 对有效 ISO 时间戳返回本地化字符串', () => {
   const result = formatTime('2026-04-20T12:00:00.000Z');
   // 至少包含年份和时间分隔符
   assert.ok(result.includes('2026'));
+});
+
+test('formatTime 对无效日期保持原有文本且不抛出异常', () => {
+  assert.equal(formatTime('invalid-date'), new Date('invalid-date').toLocaleString('zh-CN', { hour12: false }));
+  assert.equal(formatTime(Infinity), new Date(Infinity).toLocaleString('zh-CN', { hour12: false }));
+});
+
+test('formatTime 复用格式化器并在默认时区改变后保持原有日期输出', () => {
+  // 使用独立进程验证默认时区切换，避免影响其他测试的时间格式。
+  const script = `
+    const assert = require('node:assert/strict');
+    const OriginalDateTimeFormat = Intl.DateTimeFormat;
+    let formatterCount = 0;
+    Intl.DateTimeFormat = class extends OriginalDateTimeFormat {
+      constructor(...args) {
+        super(...args);
+        formatterCount += 1;
+      }
+    };
+    const { formatTime } = require(${JSON.stringify(require.resolve('../format-utils'))});
+    const values = [
+      '2026-01-01T00:00:00.000Z',
+      '2026-07-01T12:34:56.000Z',
+      '2026-03-08T07:30:00.000Z',
+      new Date('2026-11-01T06:30:00.000Z'),
+      1710000000000,
+    ];
+    const timeZones = ['UTC', 'Asia/Shanghai', 'America/New_York'];
+    for (const [index, timeZone] of timeZones.entries()) {
+      process.env.TZ = timeZone;
+      for (let iteration = 0; iteration < 2; iteration += 1) {
+        for (const value of values) {
+          assert.equal(formatTime(value), new Date(value).toLocaleString('zh-CN', { hour12: false }));
+        }
+      }
+      assert.equal(formatterCount, index + 1, '同一默认时区只应构造一次日期格式化器');
+    }
+    delete process.env.TZ;
+    assert.equal(formatTime(values[0]), new Date(values[0]).toLocaleString('zh-CN', { hour12: false }));
+    assert.equal(formatterCount, timeZones.length + 1);
+  `;
+  const result = spawnSync(process.execPath, ['-e', script], { encoding: 'utf8' });
+
+  assert.equal(result.status, 0, result.stderr || result.error?.message);
 });
 
 // ====== formatUptime ======

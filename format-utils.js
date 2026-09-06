@@ -1,5 +1,27 @@
 // Dashboard 与测试共用的格式化工具函数。
 
+const DATE_TIME_FORMAT_OPTIONS = {
+  year: 'numeric',
+  month: 'numeric',
+  day: 'numeric',
+  hour: 'numeric',
+  minute: 'numeric',
+  second: 'numeric',
+  hour12: false,
+};
+let defaultTimeFormatter = null;
+let formatterTimeZone;
+
+function getDefaultTimeFormatter() {
+  const timeZone = process.env.TZ;
+  // 复用同一默认时区的格式化器；运行时切换 TZ 后重新读取进程默认时区。
+  if (!defaultTimeFormatter || formatterTimeZone !== timeZone) {
+    defaultTimeFormatter = new Intl.DateTimeFormat('zh-CN', DATE_TIME_FORMAT_OPTIONS);
+    formatterTimeZone = timeZone;
+  }
+  return defaultTimeFormatter;
+}
+
 function escapeHtml(value) {
   return String(value ?? '')
     .replaceAll('&', '&amp;')
@@ -26,9 +48,9 @@ function formatTime(value) {
     return '-';
   }
 
-  return new Date(value).toLocaleString('zh-CN', {
-    hour12: false,
-  });
+  const date = new Date(value);
+  // Intl.format 会拒绝无效日期，保留原 toLocaleString 返回文本的行为。
+  return Number.isNaN(date.getTime()) ? date.toString() : getDefaultTimeFormatter().format(date);
 }
 
 function formatUptime(uptimeMs) {

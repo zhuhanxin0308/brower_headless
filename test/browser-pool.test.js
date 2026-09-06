@@ -159,7 +159,7 @@ test('withPage 在 newPage 失败时仍会归还浏览器到池', async () => {
     /newPage failed/,
   );
 
-  // newPage 在 context 创建之后失败，context 不一定会被关闭（因为 page 还没创建成功），
-  // 但浏览器必须被归还
+  // 页面创建失败也必须关闭已经创建的上下文，避免长期运行时积累资源。
+  assert.equal(contextClosed, true, '已创建的上下文应被关闭');
   assert.equal(releaseCalled, true, '浏览器应被归还到池');
 });

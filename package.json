@@ -5,6 +5,8 @@
   "main": "server.js",
   "scripts": {
     "test": "node --test",
+    "test:coverage": "node --test --experimental-test-coverage --test-coverage-include=*.js --test-coverage-exclude=test/** --test-coverage-lines=80 --test-coverage-branches=80 --test-coverage-functions=80",
+    "test:browser": "node --test test/browser-integration.test.js",
     "start": "node server.js",
     "dev": "node --watch server.js"
   },

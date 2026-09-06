@@ -58,6 +58,7 @@ function createMetricBucket(maxRecentLatencies) {
     lastStatusCode: null,
     recentDurations: createCircularBuffer(maxRecentLatencies),
     statusCounts: {},
+    percentiles: null,
   };
 }
 
@@ -89,11 +90,18 @@ function calculatePercentile(sortedValues, percentile) {
 }
 
 function summarizeMetricBucket(bucket) {
-  const recentDurations = bucket.recentDurations.toArray();
-  // 单次排序后复用到多个分位计算，避免首页每次刷新都重复排序同一批数据。
-  const sortedDurations = recentDurations.length > 1
-    ? [...recentDurations].sort((left, right) => left - right)
-    : recentDurations;
+  if (!bucket.percentiles) {
+    // 缓冲区导出的是独立数组，可直接排序；未新增记录时复用各分位结果。
+    const sortedDurations = bucket.recentDurations.toArray();
+    if (sortedDurations.length > 1) {
+      sortedDurations.sort((left, right) => left - right);
+    }
+    bucket.percentiles = {
+      p50DurationMs: calculatePercentile(sortedDurations, 50),
+      p95DurationMs: calculatePercentile(sortedDurations, 95),
+      p99DurationMs: calculatePercentile(sortedDurations, 99),
+    };
+  }
   const avgDurationMs = bucket.totalRequests === 0
     ? 0
     : Number((bucket.totalDurationMs / bucket.totalRequests).toFixed(2));
@@ -106,9 +114,9 @@ function summarizeMetricBucket(bucket) {
     successRequests: bucket.successRequests,
     errorRequests: bucket.errorRequests,
     avgDurationMs,
-    p50DurationMs: calculatePercentile(sortedDurations, 50),
-    p95DurationMs: calculatePercentile(sortedDurations, 95),
-    p99DurationMs: calculatePercentile(sortedDurations, 99),
+    p50DurationMs: bucket.percentiles.p50DurationMs,
+    p95DurationMs: bucket.percentiles.p95DurationMs,
+    p99DurationMs: bucket.percentiles.p99DurationMs,
     maxDurationMs: Number(bucket.maxDurationMs.toFixed(2)),
     lastDurationMs: Number(bucket.lastDurationMs.toFixed(2)),
     lastRequestedAt: bucket.lastRequestedAt,
@@ -186,6 +194,7 @@ function createStatsStore(options = {}) {
       bucket.lastStatusCode = statusCode;
       bucket.statusCounts[statusCode] = (bucket.statusCounts[statusCode] || 0) + 1;
       bucket.recentDurations.push(normalizedDuration);
+      bucket.percentiles = null;
 
       if (isSuccess) {
         bucket.successRequests += 1;
@@ -239,8 +248,9 @@ function createStatsStore(options = {}) {
       overview,
       pool,
       endpoints,
-      recentRequests: recentRequests.toReversedArray(),
-      trackedRoutes: TRACKED_API_ROUTES,
+      // 快照中的对象与数组独立，外部修改不会污染缓冲区或路由常量。
+      recentRequests: recentRequests.toReversedArray().map((request) => ({ ...request })),
+      trackedRoutes: [...TRACKED_API_ROUTES],
     };
   }
 

@@ -312,3 +312,115 @@ test('TRACKED_API_ROUTE_KEYS 是 Set 类型且内容与 TRACKED_API_ROUTES 一�
     assert.ok(TRACKED_API_ROUTE_KEYS.has(route));
   }
 });
+
+test('createStatsStore 仅在对应接口有新记录时重新计算延迟分位', (t) => {
+  const statsStore = createStatsStore({ maxRecentLatencies: 3 });
+  for (const [path, durations] of [['/render', [10, 20, 30]], ['/screenshot', [40, 50, 60]]]) {
+    for (const durationMs of durations) {
+      statsStore.recordRequest({ method: 'POST', path, statusCode: 200, durationMs });
+    }
+  }
+
+  // 只观测耗时样本的数值排序，接口展示顺序的排序不计入分位计算。
+  const originalSort = Array.prototype.sort;
+  let latencySortCount = 0;
+  t.after(() => { Array.prototype.sort = originalSort; });
+  Array.prototype.sort = function (compare) {
+    if (this.length > 1 && this.every(Number.isFinite)) {
+      latencySortCount += 1;
+    }
+    return originalSort.call(this, compare);
+  };
+
+  const firstSnapshot = statsStore.buildSnapshot();
+  assert.equal(firstSnapshot.overview.p50DurationMs, 50);
+  assert.equal(latencySortCount, 3);
+  statsStore.buildSnapshot();
+  statsStore.markRequestStart('POST', '/render');
+  const inflightSnapshot = statsStore.buildSnapshot();
+  assert.equal(inflightSnapshot.inflightRequests, 1);
+  assert.equal(latencySortCount, 3, '没有完成的新请求时应复用分位结果');
+
+  statsStore.recordRequest({ method: 'POST', path: '/render', statusCode: 200, durationMs: 100 });
+  const changedSnapshot = statsStore.buildSnapshot();
+  assert.equal(changedSnapshot.overview.p50DurationMs, 60);
+  assert.equal(changedSnapshot.endpoints.find((entry) => entry.path === '/render').p50DurationMs, 30);
+  assert.equal(changedSnapshot.endpoints.find((entry) => entry.path === '/screenshot').p50DurationMs, 50);
+  assert.equal(latencySortCount, 5, '只需重新计算整体及发生变化的接口');
+
+  statsStore.recordRequest({ method: 'GET', path: '/unknown', statusCode: 404, durationMs: 100 });
+  statsStore.buildSnapshot();
+  assert.equal(latencySortCount, 5, '未跟踪的请求不能使缓存失效');
+});
+
+test('createStatsStore 返回的快照可独立修改且不会污染后续快照', (t) => {
+  const expectedRoutes = [...TRACKED_API_ROUTES];
+  // 保证旧实现未通过隔离检查时，也不会污染其他测试使用的导出常量。
+  t.after(() => TRACKED_API_ROUTES.splice(0, TRACKED_API_ROUTES.length, ...expectedRoutes));
+  const statsStore = createStatsStore({ now: () => 1710000000000 });
+  statsStore.recordRequest({
+    method: 'POST',
+    path: '/render',
+    statusCode: 200,
+    durationMs: 120,
+    requestedAt: '2024-03-09T16:00:00.000Z',
+  });
+  const expectedSnapshot = statsStore.buildSnapshot();
+  const mutableSnapshot = statsStore.buildSnapshot();
+
+  mutableSnapshot.overview.p95DurationMs = -1;
+  mutableSnapshot.overview.statusCounts[200] = -1;
+  mutableSnapshot.endpoints[0].p95DurationMs = -1;
+  mutableSnapshot.endpoints[0].statusCounts[200] = -1;
+  mutableSnapshot.recentRequests[0].statusCode = 500;
+  mutableSnapshot.recentRequests[0].errorMessage = '外部修改';
+  mutableSnapshot.trackedRoutes.length = 0;
+
+  const freshSnapshot = statsStore.buildSnapshot();
+  assert.equal(freshSnapshot.recentRequests[0].statusCode, 200);
+  assert.equal(freshSnapshot.recentRequests[0].errorMessage, '');
+  assert.deepEqual(freshSnapshot.trackedRoutes, expectedRoutes);
+  assert.deepEqual(freshSnapshot, expectedSnapshot);
+
+  statsStore.recordRequest({ method: 'POST', path: '/render', statusCode: 500, durationMs: 300 });
+  const updatedSnapshot = statsStore.buildSnapshot();
+  assert.equal(updatedSnapshot.overview.totalRequests, 2);
+  assert.equal(updatedSnapshot.overview.p95DurationMs, 291);
+  assert.equal(expectedSnapshot.overview.totalRequests, 1);
+  assert.equal(expectedSnapshot.overview.p95DurationMs, 120);
+  assert.equal(expectedSnapshot.recentRequests.length, 1);
+});
+
+test('createStatsStore 计算分位时不会改变后续窗口淘汰的请求顺序', () => {
+  const statsStore = createStatsStore({ maxRecentLatencies: 3 });
+  const recordDuration = (durationMs) => statsStore.recordRequest({
+    method: 'POST', path: '/render', statusCode: 200, durationMs,
+  });
+  [10, 100, 20].forEach(recordDuration);
+  assert.equal(statsStore.buildSnapshot().overview.p50DurationMs, 20);
+
+  recordDuration(40);
+  assert.equal(statsStore.buildSnapshot().overview.p95DurationMs, 94);
+  recordDuration(50);
+  const snapshot = statsStore.buildSnapshot();
+  assert.equal(snapshot.overview.p50DurationMs, 40);
+  assert.equal(snapshot.overview.p95DurationMs, 49);
+  assert.equal(snapshot.overview.maxDurationMs, 100);
+});
+
+test('createStatsStore 禁用延迟样本后仍累计请求且分位保持为零', () => {
+  const statsStore = createStatsStore({ maxRecentLatencies: 0 });
+  assert.equal(statsStore.buildSnapshot().overview.p95DurationMs, 0);
+  for (const durationMs of [100, 200]) {
+    statsStore.recordRequest({ method: 'POST', path: '/render', statusCode: 200, durationMs });
+  }
+
+  const snapshot = statsStore.buildSnapshot();
+  assert.equal(snapshot.overview.totalRequests, 2);
+  assert.equal(snapshot.overview.avgDurationMs, 150);
+  assert.equal(snapshot.overview.maxDurationMs, 200);
+  assert.equal(snapshot.overview.p50DurationMs, 0);
+  assert.equal(snapshot.overview.p95DurationMs, 0);
+  assert.equal(snapshot.overview.p99DurationMs, 0);
+  assert.equal(statsStore.buildSnapshot().endpoints[0].p95DurationMs, 0);
+});

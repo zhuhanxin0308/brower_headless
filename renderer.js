@@ -1,5 +1,31 @@
 const { withPage } = require('./browser-pool');
 
+const DEFAULT_MAX_PENDING_FILE_RESPONSES = 256;
+
+function throwIfAborted(signal) {
+  if (signal?.aborted) {
+    throw signal.reason;
+  }
+}
+
+// 取消只结束当前等待，浏览器生命周期管理负责关闭页面及终止底层读取。
+function waitWithSignal(task, signal) {
+  if (!signal) {
+    return task;
+  }
+
+  return new Promise((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener('abort', onAbort, { once: true });
+    Promise.resolve(task).then(resolve, reject).finally(() => {
+      signal.removeEventListener('abort', onAbort);
+    });
+    if (signal.aborted) {
+      onAbort();
+    }
+  });
+}
+
 function createPayloadTooLargeError(maxBytes) {
   const error = new Error(`目标文件超过大小限制，最大允许 ${maxBytes} 字节`);
   error.statusCode = 413;
@@ -61,10 +87,12 @@ function createAsyncTaskTracker() {
       pendingTasks.add(wrappedTask);
       return wrappedTask;
     },
-    async waitForIdle() {
+    async waitForIdle(signal) {
+      throwIfAborted(signal);
       while (pendingTasks.size > 0) {
-        await Promise.allSettled([...pendingTasks]);
+        await waitWithSignal(Promise.allSettled([...pendingTasks]), signal);
       }
+      throwIfAborted(signal);
     },
   };
 }
@@ -110,8 +138,10 @@ async function renderPage(pool, {
   headers = {},
   cookies,
   viewport = { width: 1440, height: 900, deviceScaleFactor: 1 },
+  signal,
 }) {
   return withPage(pool, async (page) => {
+    throwIfAborted(signal);
     await page.setViewport(viewport);
 
     if (Object.keys(headers).length > 0) {
@@ -119,18 +149,20 @@ async function renderPage(pool, {
     }
 
     await injectCookies(page, url, cookies);
+    throwIfAborted(signal);
 
     await page.goto(url, {
       waitUntil: waitFor || 'networkidle2',
       timeout,
     });
+    throwIfAborted(signal);
 
     const html = await page.content();
     const title = await page.title();
     const finalUrl = page.url();
 
     return { html, title, finalUrl };
-  });
+  }, { signal });
 }
 
 async function screenshotPage(pool, {
@@ -146,8 +178,10 @@ async function screenshotPage(pool, {
   viewport = { width: 1440, height: 900, deviceScaleFactor: 1 },
   blockedResourceTypes = [],
   blockedUrlPatterns = [],
+  signal,
 }) {
   return withPage(pool, async (page) => {
+    throwIfAborted(signal);
     await page.setViewport(viewport);
     await applyRequestBlocking(page, { blockedResourceTypes, blockedUrlPatterns });
 
@@ -156,11 +190,13 @@ async function screenshotPage(pool, {
     }
 
     await injectCookies(page, url, cookies);
+    throwIfAborted(signal);
 
     await page.goto(url, {
       waitUntil: waitFor || 'networkidle2',
       timeout,
     });
+    throwIfAborted(signal);
 
     const shotOptions = { type: format, fullPage };
 
@@ -177,16 +213,18 @@ async function screenshotPage(pool, {
     const mimeMap = { png: 'image/png', jpeg: 'image/jpeg', webp: 'image/webp' };
 
     return { buffer, contentType: mimeMap[format] || 'image/png' };
-  });
+  }, { signal });
 }
 
 async function interceptRequests(pool, {
-  url, waitFor, listenUrls = [], fileTypes = [], timeout = 20000, headers = {}, cookies,
+  url, waitFor, listenUrls = [], fileTypes = [], timeout = 20000, headers = {}, cookies, signal,
 }) {
   return withPage(pool, async (page) => {
+    throwIfAborted(signal);
     const captured = [];
     const files = [];
     const tracker = createAsyncTaskTracker();
+    let stopped = false;
 
     const fileMimeMap = {
       image: ['image/'],
@@ -201,111 +239,200 @@ async function interceptRequests(pool, {
 
     const watchMimes = fileTypes.flatMap((type) => fileMimeMap[type] || []);
 
-    await page.setRequestInterception(true);
-    page.on('request', (request) => request.continue());
+    const onResponse = (response) => {
+      if (stopped || signal?.aborted) {
+        return;
+      }
 
-    page.on('response', (response) => {
-      tracker.track((async () => {
-        const responseUrl = response.url();
-        const contentType = response.headers()['content-type'] || '';
-        const status = response.status();
-
-        for (const pattern of listenUrls) {
-          if (responseUrl.includes(pattern)) {
-            try {
-              let body;
-              if (contentType.includes('application/json')) {
-                body = await response.json().catch(() => null);
-              } else {
-                body = await response.text().catch(() => null);
-              }
-
-              captured.push({ url: responseUrl, status, contentType, body });
-            } catch {
-              captured.push({ url: responseUrl, status, contentType, body: null });
-            }
-          }
+      const responseUrl = response.url();
+      let matchCount = 0;
+      for (const pattern of listenUrls) {
+        if (responseUrl.includes(pattern)) {
+          matchCount++;
         }
+      }
+      if (matchCount === 0 && watchMimes.length === 0) {
+        return;
+      }
 
-        if (watchMimes.length > 0) {
-          const matched = watchMimes.some((mime) => contentType.startsWith(mime));
-          if (matched) {
-            files.push({ url: responseUrl, contentType, status });
-          }
-        }
-      })());
-    });
+      const contentType = response.headers()['content-type'] || '';
+      const matchesFile = watchMimes.some((mime) => contentType.startsWith(mime));
+      if (matchCount === 0 && !matchesFile) {
+        return;
+      }
+      const status = response.status();
 
-    if (Object.keys(headers).length > 0) {
-      await page.setExtraHTTPHeaders(headers);
-    }
+      // 元数据收集无需异步任务，未命中的响应也不进入正文读取队列。
+      if (matchesFile) {
+        files.push({ url: responseUrl, contentType, status });
+      }
+      if (matchCount === 0) {
+        return;
+      }
 
-    await injectCookies(page, url, cookies);
-    await page.goto(url, { waitUntil: waitFor || 'networkidle2', timeout });
-    await tracker.waitForIdle();
-
-    return { finalUrl: page.url(), captured, files };
-  });
-}
-
-async function fetchFile(pool, {
-  url, fileUrl, waitFor, timeout = 20000, cookies, maxBytes,
-}) {
-  return withPage(pool, async (page) => {
-    let fileBuffer = null;
-    let contentType = '';
-    let fileError = null;
-    const normalizedMaxBytes = normalizeMaxBytes(maxBytes);
-    const tracker = createAsyncTaskTracker();
-
-    await page.setRequestInterception(true);
-    page.on('request', (request) => request.continue());
-
-    page.on('response', (response) => {
       tracker.track((async () => {
-        const matched = response.url() === fileUrl || fileUrl === '_any_';
-
-        if (!matched || fileBuffer || fileError) {
+        let body = null;
+        try {
+          body = contentType.includes('application/json')
+            ? await response.json()
+            : await response.text();
+        } catch {
+          // 保留原有读取失败返回空正文的契约，取消由外层等待保留原始原因。
+        }
+        if (stopped || signal?.aborted) {
           return;
         }
 
+        // 正文只读取一次，仍按原契约为每个匹配模式保留一条响应记录。
+        for (let index = 0; index < matchCount; index++) {
+          captured.push({ url: responseUrl, status, contentType, body });
+        }
+      })());
+    };
+
+    page.on('response', onResponse);
+    try {
+      if (Object.keys(headers).length > 0) {
+        await page.setExtraHTTPHeaders(headers);
+      }
+      await injectCookies(page, url, cookies);
+      throwIfAborted(signal);
+      await page.goto(url, { waitUntil: waitFor || 'networkidle2', timeout });
+      await tracker.waitForIdle(signal);
+      return { finalUrl: page.url(), captured, files };
+    } finally {
+      stopped = true;
+      page.off?.('response', onResponse);
+    }
+  }, { signal });
+}
+
+async function fetchFile(pool, {
+  url, fileUrl, waitFor, timeout = 20000, cookies, maxBytes, signal,
+  maxPendingResponses = DEFAULT_MAX_PENDING_FILE_RESPONSES,
+}) {
+  const pendingLimit = Number(maxPendingResponses);
+  if (!Number.isInteger(pendingLimit) || pendingLimit <= 0) {
+    throw new RangeError('候选文件队列容量必须为正整数');
+  }
+
+  return withPage(pool, async (page) => {
+    throwIfAborted(signal);
+    let fileBuffer = null;
+    let contentType = '';
+    let fileError = null;
+    let stopped = false;
+    let reading = false;
+    const candidates = [];
+    const normalizedMaxBytes = normalizeMaxBytes(maxBytes);
+    const tracker = createAsyncTaskTracker();
+    let rejectFileFailure;
+    const fileFailure = new Promise((_resolve, reject) => {
+      rejectFileFailure = reject;
+    });
+    // 导航开始前也可能收到响应，提前处理拒绝以避免事件阶段出现未处理异常。
+    fileFailure.catch(() => {});
+
+    const failFile = (error) => {
+      if (!fileError) {
+        fileError = error;
+        candidates.length = 0;
+        rejectFileFailure(error);
+      }
+    };
+
+    async function readCandidates() {
+      while (candidates.length > 0 && !stopped && !fileBuffer && !fileError && !signal?.aborted) {
+        const response = candidates.shift();
         try {
           const headers = response.headers();
           const contentLength = parseContentLength(headers);
-
           if (exceedsMaxBytes(contentLength, normalizedMaxBytes)) {
-            fileError = createPayloadTooLargeError(normalizedMaxBytes);
+            failFile(createPayloadTooLargeError(normalizedMaxBytes));
             return;
           }
 
           const buffer = await response.buffer();
+          if (stopped || fileError || signal?.aborted) {
+            return;
+          }
           if (exceedsMaxBytes(buffer.length, normalizedMaxBytes)) {
-            fileError = createPayloadTooLargeError(normalizedMaxBytes);
+            failFile(createPayloadTooLargeError(normalizedMaxBytes));
             return;
           }
 
           fileBuffer = buffer;
           contentType = headers['content-type'] || 'application/octet-stream';
+          candidates.length = 0;
         } catch {
-          fileBuffer = null;
-          contentType = '';
+          // 普通正文读取失败才尝试下一个候选，容量超限及取消均不能跳过。
         }
-      })());
-    });
-
-    await injectCookies(page, url, cookies);
-    await page.goto(url, { waitUntil: waitFor || 'networkidle2', timeout });
-    await tracker.waitForIdle();
-
-    if (fileError) {
-      throw fileError;
+      }
     }
 
-    return { buffer: fileBuffer, contentType };
-  });
+    function startReading() {
+      if (reading || stopped || fileBuffer || fileError || signal?.aborted || candidates.length === 0) {
+        return;
+      }
+      reading = true;
+      tracker.track((async () => {
+        try {
+          await readCandidates();
+        } finally {
+          reading = false;
+          // 同步读取失败与任务结束之间到达的新候选仍需继续按顺序处理。
+          startReading();
+        }
+      })());
+    }
+
+    const onResponse = (response) => {
+      if (stopped || fileBuffer || fileError || signal?.aborted) {
+        return;
+      }
+      if (fileUrl !== '_any_' && response.url() !== fileUrl) {
+        return;
+      }
+      if (candidates.length >= pendingLimit) {
+        const error = new Error(`候选文件队列已满，最大允许 ${pendingLimit} 个待处理响应`);
+        error.statusCode = 503;
+        failFile(error);
+        return;
+      }
+      candidates.push(response);
+      startReading();
+    };
+    const onAbort = () => { candidates.length = 0; };
+
+    signal?.addEventListener('abort', onAbort, { once: true });
+    page.on('response', onResponse);
+    try {
+      await injectCookies(page, url, cookies);
+      throwIfAborted(signal);
+      await Promise.race([
+        page.goto(url, { waitUntil: waitFor || 'networkidle2', timeout }),
+        fileFailure,
+      ]);
+      if (fileError) {
+        throw fileError;
+      }
+      await Promise.race([tracker.waitForIdle(signal), fileFailure]);
+      throwIfAborted(signal);
+      if (fileError) {
+        throw fileError;
+      }
+      return { buffer: fileBuffer, contentType };
+    } finally {
+      stopped = true;
+      candidates.length = 0;
+      signal?.removeEventListener('abort', onAbort);
+      page.off?.('response', onResponse);
+    }
+  }, { signal });
 }
 
 module.exports = {
+  DEFAULT_MAX_PENDING_FILE_RESPONSES,
   applyRequestBlocking,
   createAsyncTaskTracker,
   createPayloadTooLargeError,

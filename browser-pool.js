@@ -3,6 +3,22 @@ const { addExtra } = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 const UserAgentOverridePlugin = require('puppeteer-extra-plugin-stealth/evasions/user-agent-override');
 const { createPool } = require('generic-pool');
+const { closeBrowser, DEFAULT_CLEANUP_TIMEOUT_MS, withPage } = require('./browser-page');
+const { createAdmissionPool } = require('./browser-pool-admission');
+
+const DEFAULT_MIN_BROWSERS = 2;
+const DEFAULT_MAX_BROWSERS = 10;
+const DEFAULT_ACQUIRE_TIMEOUT_MS = 30000;
+const DEFAULT_SOFT_IDLE_TIMEOUT_MS = 60000;
+const DEFAULT_EVICTION_INTERVAL_MS = 30000;
+const DISABLED_HARD_IDLE_TIMEOUT_MS = Number.POSITIVE_INFINITY;
+const MAX_TIMER_DELAY_MS = (2 ** 31) - 1;
+
+function assertIntegerOption(name, value, minimum, maximum = Number.MAX_SAFE_INTEGER) {
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new RangeError(`${name} 必须是 ${minimum} 到 ${maximum} 范围内的整数`);
+  }
+}
 
 // 维持一组常见桌面端 UA，结合 stealth 插件降低被简单规则识别的概率。
 const USER_AGENTS = [
@@ -66,27 +82,35 @@ function createStealthPuppeteer(userAgent) {
 
 function createBrowserPool(options = {}) {
   const {
-    minBrowsers = 2,
-    maxBrowsers = 10,
+    minBrowsers = DEFAULT_MIN_BROWSERS,
+    maxBrowsers = DEFAULT_MAX_BROWSERS,
+    maxPendingAcquires = maxBrowsers,
+    acquireTimeoutMillis = DEFAULT_ACQUIRE_TIMEOUT_MS,
+    softIdleTimeoutMillis = DEFAULT_SOFT_IDLE_TIMEOUT_MS,
+    evictionRunIntervalMillis = DEFAULT_EVICTION_INTERVAL_MS,
+    cleanupTimeoutMillis = DEFAULT_CLEANUP_TIMEOUT_MS,
     executablePath = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium',
-  } = options;
-
-  const factory = {
-    create: async () => {
-      const userAgent = randomUA();
-      const puppeteer = createStealthPuppeteer(userAgent);
-      const browser = await puppeteer.launch({
+    launchBrowser = async () => {
+      const puppeteer = createStealthPuppeteer(randomUA());
+      return puppeteer.launch({
         executablePath,
         headless: true,
         args: CHROME_ARGS,
         ignoreHTTPSErrors: true,
       });
+    },
+  } = options;
 
-      return browser;
-    },
-    destroy: async (browser) => {
-      await browser.close().catch(() => {});
-    },
+  assertIntegerOption('maxBrowsers', maxBrowsers, 1);
+  assertIntegerOption('minBrowsers', minBrowsers, 0, maxBrowsers);
+  assertIntegerOption('maxPendingAcquires', maxPendingAcquires, 0);
+  for (const [name, value] of Object.entries({ acquireTimeoutMillis, softIdleTimeoutMillis, evictionRunIntervalMillis, cleanupTimeoutMillis })) {
+    assertIntegerOption(name, value, 1, MAX_TIMER_DELAY_MS);
+  }
+
+  const factory = {
+    create: launchBrowser,
+    destroy: (browser) => closeBrowser(browser, { cleanupTimeoutMillis }),
     validate: async (browser) => {
       try {
         return browser.isConnected();
@@ -96,33 +120,25 @@ function createBrowserPool(options = {}) {
     },
   };
 
-  return createPool(factory, {
+  const pool = createPool(factory, {
     min: minBrowsers,
     max: maxBrowsers,
+    // 底层至少容纳所有启动中的浏览器；业务等待上限由外部可取消队列统一执行。
+    maxWaitingClients: Math.max(maxPendingAcquires, maxBrowsers),
     testOnBorrow: true,
-    acquireTimeoutMillis: 30000,
-    idleTimeoutMillis: 60000,
-    evictionRunIntervalMillis: 30000,
+    acquireTimeoutMillis,
+    // 软回收只缩减多余空闲实例，禁用硬回收以保留最小预热容量。
+    softIdleTimeoutMillis,
+    idleTimeoutMillis: DISABLED_HARD_IDLE_TIMEOUT_MS,
+    evictionRunIntervalMillis,
   });
-}
-
-// 每次请求都使用独立 BrowserContext，彻底隔离 cookie、缓存和 localStorage。
-// 外层 try/finally 确保 createBrowserContext 或 newPage 失败时浏览器也能归还到池中。
-async function withPage(pool, fn) {
-  const browser = await pool.acquire();
-
-  try {
-    const context = await browser.createBrowserContext();
-    const page = await context.newPage();
-
-    try {
-      return await fn(page, context);
-    } finally {
-      await context.close().catch(() => {});
-    }
-  } finally {
-    pool.release(browser);
-  }
+  return createAdmissionPool(pool, {
+    maxBrowsers,
+    maxPendingAcquires,
+    acquireTimeoutMillis,
+    cleanupTimeoutMillis,
+    closeAbandonedBrowser: (browser) => closeBrowser(browser, { cleanupTimeoutMillis }),
+  });
 }
 
 module.exports = {
